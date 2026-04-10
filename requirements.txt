@@ -1,0 +1,10 @@
+# BTC Goldbach Day Trader — Dependencies
+ccxt>=4.4.0
+alpaca-py>=0.30.0
+pandas>=2.0.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+rich>=13.0.0
+python-telegram-bot>=21.0
+aiohttp>=3.9.0
+websockets>=12.0
