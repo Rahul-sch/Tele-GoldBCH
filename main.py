@@ -164,14 +164,24 @@ async def run_forex_cycle(
         signals = strategy_goldbach_bounce(df, lookback=30, tolerance=0.012)
         signals.extend(strategy_continuation(df))
 
-        actionable = signal_mgr.process_signals(signals)
+        # CRITICAL: Only act on signals from the last 2 bars (current + previous)
+        # Older signals have stale entries where SL may already be behind price
+        last_bar = len(df) - 1
+        fresh_signals = [s for s in signals if s.bar_index >= last_bar - 1]
+        if len(signals) != len(fresh_signals):
+            log.info("%s: %d signals total, %d fresh (last 2 bars)", pair, len(signals), len(fresh_signals))
+
+        actionable = signal_mgr.process_signals(fresh_signals)
+
+        # Current live price for validation
+        current_price = df["close"].iloc[-1]
 
         for sig in actionable:
-            # Validate SL is on correct side of entry before risking
-            if sig.direction == "buy" and sig.stop_loss >= sig.entry:
-                log.info("Skipped %s: SL $%.5f above entry $%.5f", sig.id, sig.stop_loss, sig.entry)
+            # Validate SL is on correct side of entry AND current price
+            if sig.direction == "buy" and (sig.stop_loss >= sig.entry or sig.stop_loss >= current_price):
+                log.info("Skipped %s: SL %.5f invalid vs entry %.5f / price %.5f", sig.id, sig.stop_loss, sig.entry, current_price)
                 continue
-            if sig.direction == "sell" and sig.stop_loss <= sig.entry:
+            if sig.direction == "sell" and (sig.stop_loss <= sig.entry or sig.stop_loss <= current_price):
                 log.info("Skipped %s: SL $%.5f below entry $%.5f", sig.id, sig.stop_loss, sig.entry)
                 continue
 
@@ -180,16 +190,20 @@ async def run_forex_cycle(
                 log.info("Risk blocked: %s — %s", sig.id, reason)
                 continue
 
-            # Forex position sizing: units based on pip value
-            # For major pairs, 1 pip ~= $0.0001, risk in pips * units = $ risk
-            risk_amount = risk_mgr._equity * 0.002  # 0.2% risk
-            pip_risk = abs(sig.entry - sig.stop_loss)
-            if pip_risk <= 0:
+            # Forex position sizing: 0.25% risk per trade (prop firm config)
+            pip_size = 0.01 if "JPY" in pair else 0.0001
+            pip_value = 6.5 if "JPY" in pair else 10.0  # USD per pip per standard lot
+            risk_amount = risk_mgr._equity * 0.0025
+            risk_pips = abs(sig.entry - sig.stop_loss) / pip_size
+            if risk_pips <= 0 or risk_pips > 200:  # sanity: skip >200 pip stops
                 continue
-            units = int(risk_amount / pip_risk)
-            units = min(units, 100000)  # Cap at 1 standard lot
-            if units < 1:
+            lots = risk_amount / (risk_pips * pip_value)
+            lots = min(lots, 3.0)  # cap at 3 standard lots (prop firm safe)
+            units = int(lots * 100_000)
+            if units < 1000:
                 continue
+            log.info("%s: %.1f pip risk, %.2f lots (%d units), $%.0f at risk",
+                     pair, risk_pips, lots, units, risk_amount)
 
             display_signal(sig)
             log_signal(sig)
