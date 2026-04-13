@@ -153,6 +153,19 @@ async def run_forex_cycle(
 
     trader = OandaTrader()
 
+    # ── DYNAMIC EQUITY FETCH ────────────────────────────────
+    # Fetch live NAV once per scan cycle. Every trade in this cycle
+    # sizes off the actual OANDA equity at this moment — no hardcoded
+    # base. Compounds gains, shrinks size during drawdown automatically.
+    live_equity = await trader.get_nav()
+    if live_equity <= 0:
+        log.error("Could not fetch live equity from OANDA — aborting cycle")
+        trader.close()
+        return
+    risk_mgr.update_equity(live_equity)
+    log.info("=== Live OANDA NAV: $%.2f | Risk per trade: $%.2f (0.25%%) ===",
+             live_equity, live_equity * 0.0025)
+
     for pair in FOREX_PAIRS:
         pair = pair.strip()
         df = await fetch_forex_candles(symbol=pair, timeframe="15m", limit=100)
@@ -190,20 +203,22 @@ async def run_forex_cycle(
                 log.info("Risk blocked: %s — %s", sig.id, reason)
                 continue
 
-            # Forex position sizing: 0.25% risk per trade (prop firm config)
+            # ── DYNAMIC POSITION SIZING ────────────────────────
+            # Risk = 0.25% of LIVE OANDA NAV (fetched at cycle start).
+            # Compounds gains automatically, shrinks during drawdown.
             pip_size = 0.01 if "JPY" in pair else 0.0001
             pip_value = 6.5 if "JPY" in pair else 10.0  # USD per pip per standard lot
-            risk_amount = risk_mgr._equity * 0.0025
+            risk_amount = live_equity * 0.0025  # 0.25% of LIVE equity
             risk_pips = abs(sig.entry - sig.stop_loss) / pip_size
-            if risk_pips <= 0 or risk_pips > 200:  # sanity: skip >200 pip stops
+            if risk_pips <= 0 or risk_pips > 200:
                 continue
             lots = risk_amount / (risk_pips * pip_value)
             lots = min(lots, 3.0)  # cap at 3 standard lots (prop firm safe)
             units = int(lots * 100_000)
             if units < 1000:
                 continue
-            log.info("%s: %.1f pip risk, %.2f lots (%d units), $%.0f at risk",
-                     pair, risk_pips, lots, units, risk_amount)
+            log.info("%s: %.1f pip risk | %.2f lots (%d units) | $%.2f at risk (0.25%% of $%.2f NAV)",
+                     pair, risk_pips, lots, units, risk_amount, live_equity)
 
             display_signal(sig)
             log_signal(sig)

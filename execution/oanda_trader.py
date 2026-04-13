@@ -222,15 +222,35 @@ class OandaTrader:
 
     @retry_async(max_retries=2, base_delay=1.0)
     async def get_balance(self) -> float:
-        """Get account balance."""
+        """Get realized account balance (does not include unrealized P&L)."""
         from oandapyV20.endpoints.accounts import AccountSummary
-
         try:
             r = AccountSummary(accountID=self._account_id)
             result = await asyncio.to_thread(self._api.request, r)
             return float(result.get("account", {}).get("balance", 0))
         except Exception as exc:
             log.error("Balance fetch failed: %s", exc)
+            return 0.0
+
+    @retry_async(max_retries=2, base_delay=1.0)
+    async def get_nav(self) -> float:
+        """Get live Net Asset Value (balance + unrealized P&L).
+
+        Used for dynamic position sizing — risks 0.25% of CURRENT NAV
+        on every trade. This compounds gains and shrinks size during DD.
+        """
+        from oandapyV20.endpoints.accounts import AccountSummary
+        try:
+            r = AccountSummary(accountID=self._account_id)
+            result = await asyncio.to_thread(self._api.request, r)
+            acct = result.get("account", {})
+            nav = float(acct.get("NAV", 0))
+            balance = float(acct.get("balance", 0))
+            upl = float(acct.get("unrealizedPL", 0))
+            log.info("Live NAV: $%.2f (bal $%.2f + UPL $%+.2f)", nav, balance, upl)
+            return nav
+        except Exception as exc:
+            log.error("NAV fetch failed: %s", exc)
             return 0.0
 
     def close(self) -> None:
