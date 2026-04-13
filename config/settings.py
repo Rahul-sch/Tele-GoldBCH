@@ -22,6 +22,7 @@ def _req(k: str) -> str:
 ALPACA_API_KEY: str = _req("ALPACA_API_KEY")
 ALPACA_SECRET: str = _req("ALPACA_SECRET")
 ALPACA_PAPER: bool = _get("ALPACA_PAPER", "true").lower() == "true"
+ALPACA_BASE_URL: str = _get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 # ── Trading ───────────────────────────────────────────────
 SYMBOL: str = _get("SYMBOL", "BTC/USD")

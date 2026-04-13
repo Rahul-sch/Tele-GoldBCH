@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Optional
 
-from config.settings import ALPACA_API_KEY, ALPACA_SECRET, ALPACA_PAPER, SYMBOL
+from config.settings import ALPACA_API_KEY, ALPACA_SECRET, ALPACA_PAPER, ALPACA_BASE_URL, SYMBOL
 from engine.strategies import Signal
 from utils.helpers import get_logger, retry_async
 
@@ -26,6 +26,7 @@ class PaperTrader:
             api_key=ALPACA_API_KEY,
             secret_key=ALPACA_SECRET,
             paper=ALPACA_PAPER,
+            url_override=ALPACA_BASE_URL,
         )
         self._open_orders: dict[str, dict] = {}  # signal_id → order info
 
