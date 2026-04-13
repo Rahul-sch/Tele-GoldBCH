@@ -244,9 +244,15 @@ def strategy_po3_breakout(
     return signals
 
 
-def run_all_strategies(df: pd.DataFrame) -> list[Signal]:
-    """Run both strategies and return combined signal list."""
+def run_all_strategies(df: pd.DataFrame, enable_po3: bool = False) -> list[Signal]:
+    """Run active strategies and return combined signal list.
+
+    Args:
+        enable_po3: Set True to include PO3 Breakout. Disabled by default
+                    based on 14-day backtest showing -$3,975 in current regime.
+    """
     signals: list[Signal] = []
     signals.extend(strategy_goldbach_bounce(df))
-    signals.extend(strategy_po3_breakout(df))
+    if enable_po3:
+        signals.extend(strategy_po3_breakout(df))
     return signals

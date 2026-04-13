@@ -87,8 +87,8 @@ class RiskManager:
             log.info("Size capped: %.3f → %.3f BTC ($150K notional limit)", size, max_size)
             size = max_size
 
-        # Cap: never use more than 40% of equity in one position
-        max_equity_size = (self._equity * 0.4) / signal.entry
+        # Cap: never use more than 5% of equity in one position (small bets = more data)
+        max_equity_size = (self._equity * 0.05) / signal.entry
         if size > max_equity_size:
             log.info("Size capped by equity: %.3f → %.3f BTC (40%% equity limit)", size, max_equity_size)
             size = max_equity_size
