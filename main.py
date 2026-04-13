@@ -1,13 +1,13 @@
-"""BTC Goldbach Day Trader — Main entry point.
+"""BTC Goldbach Day Trader + Forex — Main entry point.
 
 Usage:
-    python main.py                  # Run live (AM + PM sessions)
-    python main.py --once           # Single analysis cycle
-    python main.py --optimize       # Force nightly optimization now
-    python main.py --backtest 14    # Backtest last N days
-    python main.py --session am     # Only AM session
-    python main.py --session pm     # Only PM session
-    python main.py --no-tv          # Skip TradingView, use Bybit data only
+    python main.py                        # BTC on Alpaca (default)
+    python main.py --instrument forex     # Forex on OANDA
+    python main.py --instrument both      # Run BTC + Forex together
+    python main.py --once                 # Single analysis cycle
+    python main.py --once --instrument forex  # One forex scan
+    python main.py --optimize             # Force nightly optimization
+    python main.py --backtest 14          # Backtest last N days
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import asyncio
 import signal
 import sys
 
-from config.settings import SYMBOL, TIMEFRAME, TV_ENABLED, OPTIMIZER_RUN_HOUR
+from config.settings import SYMBOL, TIMEFRAME, TV_ENABLED, OPTIMIZER_RUN_HOUR, FOREX_PAIRS
 from engine.strategies import run_all_strategies
 from engine.signal_manager import SignalManager
 from data.tradingview_feed import TradingViewFeed
@@ -42,7 +42,7 @@ _TF_SECONDS = {
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="BTC Goldbach Day Trader")
+    p = argparse.ArgumentParser(description="BTC Goldbach Day Trader + Forex")
     p.add_argument("--once", action="store_true", help="Single analysis cycle")
     p.add_argument("--optimize", action="store_true", help="Run optimizer now")
     p.add_argument("--backtest", type=int, metavar="DAYS", help="Backtest last N days")
@@ -50,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-tv", action="store_true", help="Skip TradingView feed")
     p.add_argument("--symbol", default=SYMBOL, help=f"Symbol (default: {SYMBOL})")
     p.add_argument("--timeframe", default=TIMEFRAME, help=f"Timeframe (default: {TIMEFRAME})")
+    p.add_argument("--instrument", choices=["btc", "forex", "both"], default="btc",
+                   help="btc=Alpaca crypto, forex=OANDA forex pairs, both=run all")
     return p.parse_args()
 
 
@@ -139,17 +141,93 @@ async def run_analysis_cycle(
     display_status(session_name, pos_mgr.daily_pnl, pos_mgr.daily_trades, equity)
 
 
+async def run_forex_cycle(
+    signal_mgr: SignalManager,
+    pos_mgr: PositionManager,
+    risk_mgr: "RiskManager",
+) -> None:
+    """Run analysis on all forex pairs via OANDA. Both long and short."""
+    from data.oanda_feed import fetch_forex_candles
+    from execution.oanda_trader import OandaTrader
+    from engine.continuation import strategy_continuation
+
+    trader = OandaTrader()
+
+    for pair in FOREX_PAIRS:
+        pair = pair.strip()
+        df = await fetch_forex_candles(symbol=pair, timeframe="15m", limit=100)
+        if df.empty:
+            continue
+
+        # Run both strategies
+        from engine.strategies import strategy_goldbach_bounce
+        signals = strategy_goldbach_bounce(df, lookback=30, tolerance=0.012)
+        signals.extend(strategy_continuation(df))
+
+        actionable = signal_mgr.process_signals(signals)
+
+        for sig in actionable:
+            # Validate SL is on correct side of entry before risking
+            if sig.direction == "buy" and sig.stop_loss >= sig.entry:
+                log.info("Skipped %s: SL $%.5f above entry $%.5f", sig.id, sig.stop_loss, sig.entry)
+                continue
+            if sig.direction == "sell" and sig.stop_loss <= sig.entry:
+                log.info("Skipped %s: SL $%.5f below entry $%.5f", sig.id, sig.stop_loss, sig.entry)
+                continue
+
+            allowed, reason = risk_mgr.can_trade(sig, allow_shorts=True)
+            if not allowed:
+                log.info("Risk blocked: %s — %s", sig.id, reason)
+                continue
+
+            # Forex position sizing: units based on pip value
+            # For major pairs, 1 pip ~= $0.0001, risk in pips * units = $ risk
+            risk_amount = risk_mgr._equity * 0.002  # 0.2% risk
+            pip_risk = abs(sig.entry - sig.stop_loss)
+            if pip_risk <= 0:
+                continue
+            units = int(risk_amount / pip_risk)
+            units = min(units, 100000)  # Cap at 1 standard lot
+            if units < 1:
+                continue
+
+            display_signal(sig)
+            log_signal(sig)
+            await tg.alert_signal(sig)
+
+            order = await trader.place_market_order(sig, units, pair)
+            if order:
+                fill_price = order.get("average", sig.entry)
+                # Track in position manager using $ pnl estimation
+                size_for_tracking = units * 0.0001  # rough pip-to-$ for display
+                pos_mgr.open_position(
+                    signal_id=sig.id, order_id=order["id"],
+                    direction=sig.direction, entry=fill_price,
+                    size=size_for_tracking, stop_loss=sig.stop_loss,
+                    take_profit=sig.take_profit, strategy=sig.strategy,
+                )
+                log_fill(sig, units, fill_price)
+                await tg.alert_fill(sig, units, fill_price)
+                signal_mgr.mark_filled(sig.id)
+
+    trader.close()
+    console.print(f"[dim]Forex scan complete: {len(FOREX_PAIRS)} pairs[/]")
+
+
 async def run_live(args: argparse.Namespace) -> None:
     """Main live trading loop."""
     display_banner()
 
-    console.print(f"  Symbol:     {args.symbol}")
+    mode = args.instrument
+    console.print(f"  Mode:       {mode}")
+    if mode in ("btc", "both"):
+        console.print(f"  BTC Symbol: {args.symbol} (Alpaca)")
+    if mode in ("forex", "both"):
+        console.print(f"  Forex:      {', '.join(FOREX_PAIRS)} (OANDA)")
     console.print(f"  Timeframe:  {args.timeframe}")
     console.print(f"  Sessions:   {args.session}")
-    console.print(f"  TradingView: {'disabled' if args.no_tv else 'enabled'}")
     console.print()
-    console.print("  ⚠️  PAPER TRADING ONLY — Bybit Testnet")
-    console.print("  ⚠️  Not financial advice. You control all decisions.")
+    console.print("  PAPER TRADING — not financial advice.")
     console.print()
 
     # Initialize components
@@ -192,10 +270,13 @@ async def run_live(args: argparse.Namespace) -> None:
 
             if in_session:
                 console.rule(f"[cyan]Analysis @ {now_et().strftime('%H:%M:%S ET')} ({session_name} session)[/]")
-                await run_analysis_cycle(
-                    signal_mgr, paper_trader, pos_mgr, risk_mgr,
-                    tv_feed, args.symbol, args.timeframe,
-                )
+                if mode in ("btc", "both"):
+                    await run_analysis_cycle(
+                        signal_mgr, paper_trader, pos_mgr, risk_mgr,
+                        tv_feed, args.symbol, args.timeframe,
+                    )
+                if mode in ("forex", "both"):
+                    await run_forex_cycle(signal_mgr, pos_mgr, risk_mgr)
                 await asyncio.sleep(candle_seconds)
             else:
                 # Check if we should run optimizer (midnight)
@@ -245,8 +326,12 @@ async def run_once(args: argparse.Namespace) -> None:
     paper_trader = PaperTrader()
     pos_mgr = PositionManager()
     risk_mgr = RiskManager(pos_mgr)
+    mode = args.instrument
 
-    await run_analysis_cycle(signal_mgr, paper_trader, pos_mgr, risk_mgr, None, args.symbol, args.timeframe)
+    if mode in ("btc", "both"):
+        await run_analysis_cycle(signal_mgr, paper_trader, pos_mgr, risk_mgr, None, args.symbol, args.timeframe)
+    if mode in ("forex", "both"):
+        await run_forex_cycle(signal_mgr, pos_mgr, risk_mgr)
     paper_trader.close()
 
 

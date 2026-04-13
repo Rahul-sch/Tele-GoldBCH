@@ -27,8 +27,12 @@ class RiskManager:
     def update_equity(self, equity: float) -> None:
         self._equity = equity
 
-    def can_trade(self, signal: Signal) -> tuple[bool, str]:
-        """Check all risk rules. Returns (allowed, reason)."""
+    def can_trade(self, signal: Signal, allow_shorts: bool = False) -> tuple[bool, str]:
+        """Check all risk rules. Returns (allowed, reason).
+
+        Args:
+            allow_shorts: True for forex (OANDA supports shorting), False for crypto (Alpaca spot).
+        """
 
         # Circuit breaker
         if self._circuit_breaker_tripped:
@@ -41,8 +45,8 @@ class RiskManager:
                         format_usd(self._pos_mgr.daily_pnl), format_usd(MAX_DAILY_LOSS))
             return False, f"Daily loss {format_usd(self._pos_mgr.daily_pnl)} exceeds limit"
 
-        # Alpaca crypto spot: no short selling allowed (you can't sell BTC you don't own)
-        if signal.direction == "sell":
+        # Alpaca crypto spot: no short selling (can't sell BTC you don't own)
+        if signal.direction == "sell" and not allow_shorts:
             return False, "SELL signals skipped (Alpaca spot crypto — no short selling)"
 
         # Max concurrent positions
@@ -61,9 +65,11 @@ class RiskManager:
         if risk_per_unit <= 0:
             return False, "Zero risk distance"
 
-        # Min stop distance: at least $50 for BTC to avoid absurd sizing
-        if risk_per_unit < 50:
-            return False, f"Stop too tight (${risk_per_unit:.0f} < $50 minimum)"
+        # Min stop distance: $50 for BTC, 0.0005 (5 pips) for forex
+        if not allow_shorts and risk_per_unit < 50:
+            return False, f"Stop too tight (${risk_per_unit:.0f} < $50 minimum for crypto)"
+        if allow_shorts and risk_per_unit < 0.0005 and signal.entry < 200:
+            return False, f"Stop too tight ({risk_per_unit:.5f} < 5 pips minimum for forex)"
 
         return True, "OK"
 
