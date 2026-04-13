@@ -44,6 +44,9 @@ AM_SESSION_START: str = _get("AM_SESSION_START", "08:00")
 AM_SESSION_END: str = _get("AM_SESSION_END", "10:00")
 PM_SESSION_START: str = _get("PM_SESSION_START", "14:00")
 PM_SESSION_END: str = _get("PM_SESSION_END", "16:00")
+# Asia session (optional). Set both to same value to disable.
+ASIA_SESSION_START: str = _get("ASIA_SESSION_START", "00:00")
+ASIA_SESSION_END: str = _get("ASIA_SESSION_END", "00:00")
 
 # ── Strategy ──────────────────────────────────────────────
 GOLDBACH_LOOKBACK: int = int(_get("GOLDBACH_LOOKBACK", "20"))

@@ -261,9 +261,11 @@ async def run_live(args: argparse.Namespace) -> None:
 
     # Initialize components
     signal_mgr = SignalManager()
-    paper_trader = PaperTrader()
     pos_mgr = PositionManager()
     risk_mgr = RiskManager(pos_mgr)
+    # Only init Alpaca paper trader if BTC is involved (saves the misleading
+    # 'balance fetch failed' error when running pure forex mode)
+    paper_trader = PaperTrader() if mode in ("btc", "both") else None
 
     # TradingView feed (optional)
     tv_feed = None
@@ -276,13 +278,17 @@ async def run_live(args: argparse.Namespace) -> None:
             log.info("TradingView not available — using Bybit data")
             tv_feed = None
 
-    # Get initial equity
-    equity = await paper_trader.get_balance()
-    if equity > 0:
-        risk_mgr.update_equity(equity)
-        log.info("Bybit testnet balance: $%.2f", equity)
+    # Initial equity — for forex, dynamic NAV is fetched per cycle (see run_forex_cycle).
+    # This block is just for BTC mode. For pure forex, skip the Alpaca call entirely.
+    if paper_trader is not None:
+        equity = await paper_trader.get_balance()
+        if equity > 0:
+            risk_mgr.update_equity(equity)
+            log.info("Alpaca paper balance: $%.2f", equity)
+        else:
+            log.info("Alpaca balance unavailable — using default $%.2f", risk_mgr._equity)
     else:
-        log.info("Using default equity: $%.2f", risk_mgr._equity)
+        log.info("Forex mode: live OANDA NAV will be fetched per scan cycle")
 
     candle_seconds = _TF_SECONDS.get(args.timeframe, 900)
     last_optimizer_date = None
@@ -343,7 +349,8 @@ async def run_live(args: argparse.Namespace) -> None:
     losses = sum(1 for p in pos_mgr.closed_positions if p.pnl <= 0)
     await tg.alert_session_summary(session_name, pos_mgr.daily_trades, pos_mgr.daily_pnl, wins, losses)
 
-    paper_trader.close()
+    if paper_trader is not None:
+        paper_trader.close()
     if tv_feed:
         await tv_feed.disconnect()
 
@@ -352,16 +359,17 @@ async def run_once(args: argparse.Namespace) -> None:
     """Single analysis cycle."""
     display_banner()
     signal_mgr = SignalManager()
-    paper_trader = PaperTrader()
     pos_mgr = PositionManager()
     risk_mgr = RiskManager(pos_mgr)
     mode = args.instrument
+    paper_trader = PaperTrader() if mode in ("btc", "both") else None
 
     if mode in ("btc", "both"):
         await run_analysis_cycle(signal_mgr, paper_trader, pos_mgr, risk_mgr, None, args.symbol, args.timeframe)
     if mode in ("forex", "both"):
         await run_forex_cycle(signal_mgr, pos_mgr, risk_mgr)
-    paper_trader.close()
+    if paper_trader is not None:
+        paper_trader.close()
 
 
 async def run_backtest(args: argparse.Namespace) -> None:

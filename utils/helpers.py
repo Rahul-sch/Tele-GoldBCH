@@ -10,7 +10,11 @@ from zoneinfo import ZoneInfo
 from functools import wraps
 from typing import Any, Callable
 
-from config.settings import LOG_LEVEL, AM_SESSION_START, AM_SESSION_END, PM_SESSION_START, PM_SESSION_END
+from config.settings import (
+    LOG_LEVEL, AM_SESSION_START, AM_SESSION_END,
+    PM_SESSION_START, PM_SESSION_END,
+    ASIA_SESSION_START, ASIA_SESSION_END,
+)
 
 ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
@@ -32,40 +36,53 @@ def now_et() -> datetime:
     return datetime.now(ET)
 
 
+def _parse(s: str) -> dt_time:
+    return dt_time(*map(int, s.split(":")))
+
+
 def is_in_session() -> tuple[bool, str]:
     """Check if current time (ET) is within a trading session.
 
     Returns (in_session, session_name).
+    Supports AM (London/NY morning), PM (NY afternoon), and ASIA (Tokyo).
     """
     t = now_et().time()
-    am_start = dt_time(*map(int, AM_SESSION_START.split(":")))
-    am_end = dt_time(*map(int, AM_SESSION_END.split(":")))
-    pm_start = dt_time(*map(int, PM_SESSION_START.split(":")))
-    pm_end = dt_time(*map(int, PM_SESSION_END.split(":")))
-
-    if am_start <= t <= am_end:
+    if _parse(AM_SESSION_START) <= t <= _parse(AM_SESSION_END):
         return True, "AM"
-    if pm_start <= t <= pm_end:
+    if _parse(PM_SESSION_START) <= t <= _parse(PM_SESSION_END):
         return True, "PM"
+    # ASIA session may wrap past midnight; only enable if start != end
+    if ASIA_SESSION_START != ASIA_SESSION_END:
+        a_start = _parse(ASIA_SESSION_START)
+        a_end = _parse(ASIA_SESSION_END)
+        if a_start <= a_end:
+            if a_start <= t <= a_end:
+                return True, "ASIA"
+        else:
+            # wraps midnight (e.g. 23:00 to 03:00)
+            if t >= a_start or t <= a_end:
+                return True, "ASIA"
     return False, "OFF"
 
 
 def seconds_until_next_session() -> float:
     """Seconds until the next session starts."""
+    import datetime as dt_module
     now = now_et()
     t = now.time()
-    am_start = dt_time(*map(int, AM_SESSION_START.split(":")))
-    pm_start = dt_time(*map(int, PM_SESSION_START.split(":")))
+    sessions = [_parse(AM_SESSION_START), _parse(PM_SESSION_START)]
+    if ASIA_SESSION_START != ASIA_SESSION_END:
+        sessions.append(_parse(ASIA_SESSION_START))
+    sessions.sort()
 
-    for session_time in [am_start, pm_start]:
+    for session_time in sessions:
         if t < session_time:
             target = now.replace(hour=session_time.hour, minute=session_time.minute, second=0, microsecond=0)
             return (target - now).total_seconds()
 
-    # Next AM tomorrow
-    import datetime as dt_module
+    # Next session is tomorrow's earliest
     tomorrow = now + dt_module.timedelta(days=1)
-    target = tomorrow.replace(hour=am_start.hour, minute=am_start.minute, second=0, microsecond=0)
+    target = tomorrow.replace(hour=sessions[0].hour, minute=sessions[0].minute, second=0, microsecond=0)
     return (target - now).total_seconds()
 
 
