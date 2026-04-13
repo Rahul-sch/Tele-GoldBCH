@@ -41,6 +41,10 @@ class RiskManager:
                         format_usd(self._pos_mgr.daily_pnl), format_usd(MAX_DAILY_LOSS))
             return False, f"Daily loss {format_usd(self._pos_mgr.daily_pnl)} exceeds limit"
 
+        # Alpaca crypto spot: no short selling allowed (you can't sell BTC you don't own)
+        if signal.direction == "sell":
+            return False, "SELL signals skipped (Alpaca spot crypto — no short selling)"
+
         # Max concurrent positions
         if self._pos_mgr.open_count >= MAX_CONCURRENT_POSITIONS:
             return False, f"Max positions reached ({MAX_CONCURRENT_POSITIONS})"
@@ -57,12 +61,17 @@ class RiskManager:
         if risk_per_unit <= 0:
             return False, "Zero risk distance"
 
+        # Min stop distance: at least $50 for BTC to avoid absurd sizing
+        if risk_per_unit < 50:
+            return False, f"Stop too tight (${risk_per_unit:.0f} < $50 minimum)"
+
         return True, "OK"
 
     def calculate_size(self, signal: Signal) -> float:
         """Calculate position size in BTC based on risk.
 
         size = (equity × risk_pct) / |entry - stop_loss|
+        Capped at max notional of $150K (Alpaca limit ~$200K, keep buffer).
         """
         risk_amount = self._equity * RISK_PER_TRADE
         risk_per_unit = abs(signal.entry - signal.stop_loss)
@@ -72,15 +81,27 @@ class RiskManager:
 
         size = risk_amount / risk_per_unit
 
-        # Round to 3 decimal places for BTC
-        size = round(size, 3)
+        # Cap: max $150K notional (Alpaca's per-order limit is $200K)
+        max_size = 150_000 / signal.entry
+        if size > max_size:
+            log.info("Size capped: %.3f → %.3f BTC ($150K notional limit)", size, max_size)
+            size = max_size
+
+        # Cap: never use more than 40% of equity in one position
+        max_equity_size = (self._equity * 0.4) / signal.entry
+        if size > max_equity_size:
+            log.info("Size capped by equity: %.3f → %.3f BTC (40%% equity limit)", size, max_equity_size)
+            size = max_equity_size
+
+        # Round to 5 decimal places for BTC
+        size = round(size, 5)
 
         # Minimum order size check
-        if size < 0.001:
-            log.warning("Calculated size %.6f too small (min 0.001 BTC)", size)
+        if size < 0.0001:
+            log.warning("Calculated size %.6f too small (min 0.0001 BTC)", size)
             return 0.0
 
-        log.info("Size: %.3f BTC | Risk: %s | Entry: $%.0f | SL: $%.0f",
+        log.info("Size: %.5f BTC | Risk: %s | Entry: $%.0f | SL: $%.0f",
                  size, format_usd(risk_amount), signal.entry, signal.stop_loss)
         return size
 
