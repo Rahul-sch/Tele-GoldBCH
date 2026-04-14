@@ -20,9 +20,13 @@ from utils.helpers import get_logger
 log = get_logger("position_monitor")
 
 # Tunables
-BREAK_EVEN_TRIGGER_R = 1.0       # move to BE at 1R profit
-TRAILING_TRIGGER_R = 2.0         # start trailing at 2R profit
-ATR_MULT_TRAIL = 2.0             # chandelier trail = high - 2 × ATR
+BREAK_EVEN_TRIGGER_R = 1.0       # move to BE at 1R profit (KEEP — pure win)
+ENABLE_TRAILING = False          # DISABLED — trail stops triggered before TP
+                                 # on R:R 3.0 trades, costing $850 on first night.
+                                 # Re-enable if you implement partial-close logic
+                                 # so TP hits FIRST, then trail runs the remainder.
+TRAILING_TRIGGER_R = 2.0         # not used while ENABLE_TRAILING=False
+ATR_MULT_TRAIL = 2.0             # not used while ENABLE_TRAILING=False
 ATR_PERIOD = 14
 
 
@@ -90,7 +94,7 @@ async def manage_open_positions(
         action_type = None
 
         # Trailing stop logic (priority over BE — if we're past 2R, trail)
-        if r_multiple >= TRAILING_TRIGGER_R:
+        if ENABLE_TRAILING and r_multiple >= TRAILING_TRIGGER_R:
             # Chandelier: high - N * ATR (for longs)
             lookback = min(20, len(df))
             recent = df.tail(lookback)
