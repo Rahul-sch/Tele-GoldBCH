@@ -5,3 +5,10 @@ __pycache__/
 logs/
 screenshots/
 .pids
+
+# Next.js
+mobile-dashboard/node_modules/
+mobile-dashboard/.next/
+mobile-dashboard/.env.local
+mobile-dashboard/.env.production
+mobile-dashboard/out/

@@ -242,6 +242,13 @@ async def run_forex_cycle(
     trader.close()
     console.print(f"[dim]Forex scan complete: {len(FOREX_PAIRS)} pairs[/]")
 
+    # Push live state to Upstash Redis for mobile dashboard (non-blocking)
+    try:
+        from cloud_sync import sync_now
+        await sync_now()
+    except Exception as exc:
+        log.debug("Cloud sync skipped: %s", exc)
+
 
 async def run_live(args: argparse.Namespace) -> None:
     """Main live trading loop."""
