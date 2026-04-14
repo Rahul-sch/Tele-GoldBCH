@@ -152,6 +152,9 @@ async def run_forex_cycle(
     from engine.continuation import strategy_continuation
     from engine.news_calendar import check_news_blackout
     from engine.correlation_filter import is_correlated_overexposure
+    from engine.meta_filter import should_take_signal, load_prior_outcomes
+
+    prior_outcomes = load_prior_outcomes()
 
     trader = OandaTrader()
 
@@ -215,7 +218,6 @@ async def run_forex_cycle(
                 continue
 
             # ── PHASE A FILTER 2: CORRELATION ──
-            # Block redundant trades on correlated pairs in same direction
             blocked, corr_reason = is_correlated_overexposure(
                 new_pair=pair,
                 new_direction=sig.direction,
@@ -225,6 +227,14 @@ async def run_forex_cycle(
             if blocked:
                 log.info("CORR BLOCK: %s — %s", sig.id, corr_reason)
                 continue
+
+            # ── PHASE C FILTER 3: META-MODEL (XGBoost win probability) ──
+            take, prob = should_take_signal(df, sig, pair, prior_outcomes=prior_outcomes)
+            if prob is not None:
+                log.info("%s: meta-model p(win)=%.2f", pair, prob)
+                if not take:
+                    log.info("META BLOCK: %s — p(win)=%.2f below threshold", sig.id, prob)
+                    continue
 
             allowed, reason = risk_mgr.can_trade(sig, allow_shorts=True)
             if not allowed:
