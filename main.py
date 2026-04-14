@@ -153,8 +153,14 @@ async def run_forex_cycle(
     from engine.news_calendar import check_news_blackout
     from engine.correlation_filter import is_correlated_overexposure
     from engine.meta_filter import should_take_signal, load_prior_outcomes
+    from engine.circuit_breaker import get_breaker
+    from execution.position_monitor import manage_open_positions
+    from execution.closure_detector import detect_new_closures
+    from output import telegram_alerts as tg
+    from config.settings import OANDA_TOKEN, OANDA_ACCOUNT_ID, OANDA_ENVIRONMENT
 
     prior_outcomes = load_prior_outcomes()
+    breaker = get_breaker()
 
     trader = OandaTrader()
 
@@ -168,16 +174,51 @@ async def run_forex_cycle(
     log.info("=== Live OANDA NAV: $%.2f | Risk per trade: $%.2f (0.25%%) ===",
              live_equity, live_equity * 0.0025)
 
-    # Fetch current open positions once (for correlation filter)
-    open_positions = await trader.get_open_trades()
+    # ── CIRCUIT BREAKER CHECK ──
+    can_trade_now, breaker_reason = breaker.check(live_equity)
+    breaker_status = breaker.status(live_equity)
+    if not can_trade_now:
+        log.warning("CIRCUIT BREAKER TRIPPED — %s. Skipping new entries this cycle.", breaker_reason)
+        await tg.alert_circuit_breaker(breaker_reason, breaker_status)
+    else:
+        log.info("Circuit OK — daily DD %.2f%%, weekly DD %.2f%%, consec losses %d",
+                 breaker_status["daily_dd_pct"] * 100,
+                 breaker_status["weekly_dd_pct"] * 100,
+                 breaker_status["consec_losses"])
 
-    # Pre-fetch all pair candles (needed for both strategies AND correlation)
+    # Pre-fetch all pair candles (needed for strategies AND correlation AND position mgmt)
     candles_by_pair: dict = {}
     for p in FOREX_PAIRS:
         p = p.strip()
         candles_by_pair[p] = await fetch_forex_candles(symbol=p, timeframe="15m", limit=100)
 
-    for pair in FOREX_PAIRS:
+    # ── DETECT NEW CLOSURES (record outcomes for circuit breaker + meta-filter) ──
+    new_closures = await detect_new_closures(OANDA_TOKEN, OANDA_ACCOUNT_ID, OANDA_ENVIRONMENT)
+    for closure in new_closures:
+        emoji = "✅" if closure["label"] == 1 else "❌"
+        await tg._send(
+            f"{emoji} <b>TRADE CLOSED</b>\n"
+            f"{closure['instrument']} {closure['direction'].upper()}\n"
+            f"Outcome: {closure['outcome']}\n"
+            f"PnL: ${closure['pnl']:+.2f}"
+        )
+
+    # ── MANAGE OPEN POSITIONS (trailing stops + break-even) ──
+    sl_actions = await manage_open_positions(trader, candles_by_pair)
+    for action in sl_actions:
+        await tg.alert_sl_modified(action)
+
+    # Re-fetch open positions (SL may have been modified)
+    open_positions = await trader.get_open_trades()
+
+    # Skip new entries entirely if circuit breaker tripped (still manage open positions above)
+    if not can_trade_now:
+        log.info("Skipping new-entry scan due to circuit breaker.")
+        FOREX_PAIRS_TO_SCAN = []
+    else:
+        FOREX_PAIRS_TO_SCAN = FOREX_PAIRS
+
+    for pair in FOREX_PAIRS_TO_SCAN:
         pair = pair.strip()
         df = candles_by_pair.get(pair)
         if df is None or df.empty:

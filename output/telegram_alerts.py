@@ -95,3 +95,27 @@ async def alert_optimizer(best_params: dict) -> None:
         f"SL mult: {best_params.get('sl_mult')}\n"
         f"Backtest PnL: {format_usd(best_params.get('total_pnl', 0))}"
     )
+
+
+async def alert_circuit_breaker(reason: str, status: dict) -> None:
+    """Notify when circuit breaker trips."""
+    await _send(
+        f"🚨 <b>CIRCUIT BREAKER TRIPPED</b>\n"
+        f"Reason: {reason}\n"
+        f"Daily DD: {status.get('daily_dd_pct', 0) * 100:.2f}%\n"
+        f"Weekly DD: {status.get('weekly_dd_pct', 0) * 100:.2f}%\n"
+        f"Consec losses: {status.get('consec_losses', 0)}\n"
+        f"⏸ New entries paused"
+    )
+
+
+async def alert_sl_modified(action: dict) -> None:
+    """Notify when trailing stop or break-even moves an SL."""
+    icon = "🔒" if action["action"] == "break_even" else "📈"
+    await _send(
+        f"{icon} <b>SL MODIFIED</b>\n"
+        f"{action['pair']} {action['direction'].upper()}\n"
+        f"Action: {action['action'].replace('_', ' ').title()}\n"
+        f"SL: {action['old_sl']:.5f} → {action['new_sl']:.5f}\n"
+        f"R-multiple: +{action['r_multiple']:.2f}R"
+    )
