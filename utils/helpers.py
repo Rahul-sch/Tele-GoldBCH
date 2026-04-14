@@ -14,6 +14,7 @@ from config.settings import (
     LOG_LEVEL, AM_SESSION_START, AM_SESSION_END,
     PM_SESSION_START, PM_SESSION_END,
     ASIA_SESSION_START, ASIA_SESSION_END,
+    SESSIONS_24_7,
 )
 
 ET = ZoneInfo("America/New_York")
@@ -45,7 +46,10 @@ def is_in_session() -> tuple[bool, str]:
 
     Returns (in_session, session_name).
     Supports AM (London/NY morning), PM (NY afternoon), and ASIA (Tokyo).
+    SESSIONS_24_7=true bypasses all windows (forex runs 24/5).
     """
+    if SESSIONS_24_7:
+        return True, "24/7"
     t = now_et().time()
     if _parse(AM_SESSION_START) <= t <= _parse(AM_SESSION_END):
         return True, "AM"

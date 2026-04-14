@@ -40,6 +40,8 @@ MIN_RISK_REWARD: float = float(_get("MIN_RISK_REWARD", "1.5"))
 INITIAL_EQUITY: float = float(_get("INITIAL_EQUITY", "10000"))
 
 # ── Sessions (ET) ─────────────────────────────────────────
+# Set SESSIONS_24_7=true to run around the clock (overrides all windows below)
+SESSIONS_24_7: bool = _get("SESSIONS_24_7", "false").lower() == "true"
 AM_SESSION_START: str = _get("AM_SESSION_START", "08:00")
 AM_SESSION_END: str = _get("AM_SESSION_END", "10:00")
 PM_SESSION_START: str = _get("PM_SESSION_START", "14:00")
