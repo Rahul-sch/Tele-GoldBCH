@@ -280,6 +280,21 @@ async def run_forex_cycle(
     trader.close()
     console.print(f"[dim]Forex scan complete: {len(FOREX_PAIRS)} pairs[/]")
 
+    # Heartbeat — write timestamp file so we can verify bot is alive without
+    # paging through stdout. mtime of this file = last successful scan.
+    try:
+        from pathlib import Path
+        from datetime import datetime, timezone
+        Path("logs").mkdir(parents=True, exist_ok=True)
+        Path("logs/last_scan.txt").write_text(
+            f"{datetime.now(timezone.utc).isoformat()}\n"
+            f"NAV: ${live_equity:.2f}\n"
+            f"Open positions: {len(open_positions)}\n"
+            f"Pairs scanned: {', '.join(FOREX_PAIRS)}\n"
+        )
+    except Exception as exc:
+        log.debug("Heartbeat write failed: %s", exc)
+
     # Push live state to Upstash Redis for mobile dashboard (non-blocking)
     try:
         from cloud_sync import sync_now

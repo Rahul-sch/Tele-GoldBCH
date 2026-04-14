@@ -25,9 +25,19 @@ log_ok "Ready"
 mkdir -p "$SCRIPT_DIR/logs" "$SCRIPT_DIR/screenshots"
 echo ""
 echo -e "${CYAN}╔═══════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║  BTC Goldbach Day Trader                  ║${NC}"
-echo -e "${CYAN}║  Goldbach Bounce + PO3 Breakout           ║${NC}"
-echo -e "${CYAN}║  Bybit Testnet Paper Trading              ║${NC}"
+echo -e "${CYAN}║  Tele-GoldBCH Day Trader                  ║${NC}"
+echo -e "${CYAN}║  Continuation + Goldbach + Meta-Filter    ║${NC}"
+echo -e "${CYAN}║  OANDA Practice / Alpaca Paper            ║${NC}"
 echo -e "${CYAN}╚═══════════════════════════════════════════╝${NC}"
 echo ""
-exec "$VENV/bin/python" main.py "$@"
+
+# Tee output to terminal AND a rolling log file (so I can debug remotely).
+LOG_FILE="$SCRIPT_DIR/logs/forward_test.log"
+if [[ -f "$LOG_FILE" ]]; then
+    mv "$LOG_FILE" "$LOG_FILE.$(date +%Y%m%d_%H%M%S).bak" 2>/dev/null || true
+fi
+echo "Logging to: $LOG_FILE"
+echo ""
+
+# Python unbuffered so logs are written real-time, not held in stdout buffer.
+PYTHONUNBUFFERED=1 "$VENV/bin/python" main.py "$@" 2>&1 | tee "$LOG_FILE"
