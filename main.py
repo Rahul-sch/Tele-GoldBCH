@@ -150,13 +150,12 @@ async def run_forex_cycle(
     from data.oanda_feed import fetch_forex_candles
     from execution.oanda_trader import OandaTrader
     from engine.continuation import strategy_continuation
+    from engine.news_calendar import check_news_blackout
+    from engine.correlation_filter import is_correlated_overexposure
 
     trader = OandaTrader()
 
     # ── DYNAMIC EQUITY FETCH ────────────────────────────────
-    # Fetch live NAV once per scan cycle. Every trade in this cycle
-    # sizes off the actual OANDA equity at this moment — no hardcoded
-    # base. Compounds gains, shrinks size during drawdown automatically.
     live_equity = await trader.get_nav()
     if live_equity <= 0:
         log.error("Could not fetch live equity from OANDA — aborting cycle")
@@ -166,16 +165,33 @@ async def run_forex_cycle(
     log.info("=== Live OANDA NAV: $%.2f | Risk per trade: $%.2f (0.25%%) ===",
              live_equity, live_equity * 0.0025)
 
+    # Fetch current open positions once (for correlation filter)
+    open_positions = await trader.get_open_trades()
+
+    # Pre-fetch all pair candles (needed for both strategies AND correlation)
+    candles_by_pair: dict = {}
+    for p in FOREX_PAIRS:
+        p = p.strip()
+        candles_by_pair[p] = await fetch_forex_candles(symbol=p, timeframe="15m", limit=100)
+
     for pair in FOREX_PAIRS:
         pair = pair.strip()
-        df = await fetch_forex_candles(symbol=pair, timeframe="15m", limit=100)
-        if df.empty:
+        df = candles_by_pair.get(pair)
+        if df is None or df.empty:
             continue
 
-        # Run both strategies
-        from engine.strategies import strategy_goldbach_bounce
-        signals = strategy_goldbach_bounce(df, lookback=30, tolerance=0.012)
-        signals.extend(strategy_continuation(df))
+        # ── PHASE A FILTER 1: NEWS BLACKOUT ──
+        is_blackout, news_reason = await check_news_blackout(pair, buffer_minutes=30)
+        if is_blackout:
+            log.info("%s: NEWS BLACKOUT — %s (no trades this cycle)", pair, news_reason)
+            continue
+
+        # ── PHASE A FINDING ──
+        # 6-month backtest showed Goldbach Bounce is a net loser on forex
+        # (25% win rate, -$895 over 1,796 trades). Continuation is the real
+        # edge (70% win rate, +$4,323 over 1,045 trades). Running continuation
+        # only on forex. Goldbach Bounce stays enabled for BTC where it works.
+        signals = strategy_continuation(df)
 
         # CRITICAL: Only act on signals from the last 2 bars (current + previous)
         # Older signals have stale entries where SL may already be behind price
@@ -196,6 +212,18 @@ async def run_forex_cycle(
                 continue
             if sig.direction == "sell" and (sig.stop_loss <= sig.entry or sig.stop_loss <= current_price):
                 log.info("Skipped %s: SL $%.5f below entry $%.5f", sig.id, sig.stop_loss, sig.entry)
+                continue
+
+            # ── PHASE A FILTER 2: CORRELATION ──
+            # Block redundant trades on correlated pairs in same direction
+            blocked, corr_reason = is_correlated_overexposure(
+                new_pair=pair,
+                new_direction=sig.direction,
+                open_positions=open_positions,
+                candles_by_pair=candles_by_pair,
+            )
+            if blocked:
+                log.info("CORR BLOCK: %s — %s", sig.id, corr_reason)
                 continue
 
             allowed, reason = risk_mgr.can_trade(sig, allow_shorts=True)
