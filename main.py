@@ -361,7 +361,7 @@ async def run_nasdaq_cycle(
     """Run analysis on NAS100 via OANDA. Nasdaq-specific session gating + earnings blackout."""
     from data.oanda_feed import fetch_forex_candles
     from execution.oanda_trader import OandaTrader
-    from engine.continuation import strategy_continuation, compute_rvol, compute_adx
+    from engine.continuation import strategy_continuation_nasdaq
     from engine.earnings_calendar import is_earnings_blackout_nasdaq
     from engine.meta_filter import should_take_signal, load_prior_outcomes
     from engine.circuit_breaker import get_breaker
@@ -430,11 +430,8 @@ async def run_nasdaq_cycle(
     open_positions = await trader.get_open_trades()
 
     # ── GENERATE SIGNALS ──
-    # Use Nasdaq-specific parameters: higher ADX threshold, longer RVOL period
-    signals = strategy_continuation(
-        df,
-        adx_threshold=NASDAQ_ADX_THRESHOLD,  # 22 instead of 18
-    )
+    # Use Nasdaq-optimized continuation strategy
+    signals = strategy_continuation_nasdaq(df)
 
     # Set symbol
     for s in signals:

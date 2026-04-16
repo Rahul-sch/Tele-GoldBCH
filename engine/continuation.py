@@ -491,6 +491,243 @@ def strategy_continuation(
     return signals
 
 
+def strategy_continuation_nasdaq(
+    df: pd.DataFrame,
+    atr_sl_mult: float = 1.5,  # Wider stops for Nasdaq volatility
+    rr_ratio: float = 3.0,
+    displacement_threshold: float = 1.0,
+    retest_max_bars: int = 5,
+    adx_threshold: float = 22.0,  # Higher for Nasdaq trending requirement
+    rvol_multiplier: float = 1.0,
+    rvol_period: int = 20,  # Longer baseline for session-rhythm adaptation
+    require_sweep: bool = False,
+    require_orderblock: bool = False,
+    sweep_window: int = 10,
+) -> list[Signal]:
+    """ICT FVG continuation strategy optimized for Nasdaq (US100/NAS100).
+
+    Nasdaq-specific adaptations:
+    - ADX > 22 (vs 18 for forex): stricter trend requirement
+    - SL multiplier 1.5× ATR (vs 1.0): wider stops for 3-5× higher volatility
+    - RVOL 20-period baseline (vs 10): session-aware volume regime
+    - Same FVG detection but optimized for index gaps
+
+    ARM → RETEST → ENTER logic:
+    1. Detect FVG on displacement candle (ATR-normalized)
+    2. Arm limit order at FVG edge
+    3. Enter only if price retests FVG within retest_max_bars
+    4. SL: ATR × 1.5 below entry (wider for Nasdaq noise)
+    5. TP: risk × 3.0 R:R
+    """
+    signals: list[Signal] = []
+
+    # Compute indicators
+    atr = compute_atr(df)
+    adx = compute_adx(df)
+    rvol = compute_rvol(df, period=rvol_period)  # Use Nasdaq period
+    candle_range = df["high"] - df["low"]
+    is_displacement = candle_range > (atr * displacement_threshold)
+
+    # Trend: 1H EMA slope
+    try:
+        trend = compute_htf_ema_signal(df)
+    except Exception:
+        sma20 = df["close"].rolling(20).mean()
+        trend = pd.Series(0, index=df.index)
+        trend[sma20.diff() > 0] = 1
+        trend[sma20.diff() < 0] = -1
+
+    # FVGs
+    bull_top, bull_bot, bear_top, bear_bot = detect_fvgs(df)
+
+    # Armed orders
+    armed_bull: Dict[int, tuple] = {}
+    armed_bear: Dict[int, tuple] = {}
+
+    for i in range(30, len(df)):
+        # ── ARM bullish FVGs ──
+        if not np.isnan(bull_top.iloc[i]) and is_displacement.iloc[i]:
+            gap_size = bull_top.iloc[i] - bull_bot.iloc[i]
+            is_bull_candle = df["close"].iloc[i] > df["open"].iloc[i]
+            if (trend.iloc[i] == 1
+                    and adx.iloc[i] >= adx_threshold
+                    and is_bull_candle
+                    and gap_size >= 0.3 * atr.iloc[i]
+                    and rvol.iloc[i] >= 1.0):
+                if require_sweep and not has_recent_sweep(
+                    "bull", i,
+                    df["high"].values, df["low"].values, df["close"].values,
+                    atr.iloc[i], sweep_window=sweep_window,
+                ):
+                    continue
+                if require_orderblock and not has_order_block(
+                    "bull", i, df["open"].values, df["close"].values,
+                ):
+                    continue
+                armed_bull[i] = (
+                    float(bull_top.iloc[i]),
+                    float(bull_bot.iloc[i]),
+                    i,
+                    float(candle_range.iloc[i]),
+                )
+
+        # ── ARM bearish FVGs ──
+        if not np.isnan(bear_top.iloc[i]) and is_displacement.iloc[i]:
+            gap_size = bear_top.iloc[i] - bear_bot.iloc[i]
+            is_bear_candle = df["close"].iloc[i] < df["open"].iloc[i]
+            if (trend.iloc[i] == -1
+                    and adx.iloc[i] >= adx_threshold
+                    and is_bear_candle
+                    and gap_size >= 0.3 * atr.iloc[i]
+                    and rvol.iloc[i] >= 1.0):
+                if require_sweep and not has_recent_sweep(
+                    "bear", i,
+                    df["high"].values, df["low"].values, df["close"].values,
+                    atr.iloc[i], sweep_window=sweep_window,
+                ):
+                    continue
+                if require_orderblock and not has_order_block(
+                    "bear", i, df["open"].values, df["close"].values,
+                ):
+                    continue
+                armed_bear[i] = (
+                    float(bear_bot.iloc[i]),
+                    float(bear_top.iloc[i]),
+                    i,
+                    float(candle_range.iloc[i]),
+                )
+
+        # ── Check bullish retests ──
+        expired_bull = []
+        for fvg_bar, (limit_price, fvg_bot, armed_bar, disp_range) in armed_bull.items():
+            bars_elapsed = i - armed_bar
+            if bars_elapsed > retest_max_bars:
+                expired_bull.append(fvg_bar)
+                continue
+            if df["low"].iloc[i] < fvg_bot:
+                expired_bull.append(fvg_bar)
+                continue
+            if not (df["low"].iloc[i] <= limit_price <= df["high"].iloc[i]):
+                continue
+            if rvol.iloc[i] < rvol_multiplier:
+                expired_bull.append(fvg_bar)
+                continue
+
+            atr_val = atr.iloc[i]
+            entry = limit_price
+            sl = entry - atr_val * atr_sl_mult
+            risk = entry - sl
+            tp = entry + risk * rr_ratio
+            if risk <= 0 or (tp - entry) / risk < 1.5:
+                continue
+
+            # IRL target
+            irl = find_irl_target("buy", i, entry, tp, df["high"].values, df["low"].values)
+            if not np.isnan(irl) and irl < tp:
+                tp = irl
+
+            rr = (tp - entry) / risk
+            if rr < 1.5:
+                expired_bull.append(fvg_bar)
+                continue
+
+            # Confidence
+            conf = 5
+            if adx.iloc[i] > 30:
+                conf += 2
+            elif adx.iloc[i] > 25:
+                conf += 1
+            if rvol.iloc[i] > 1.5:
+                conf += 1
+            gap_size = limit_price - fvg_bot
+            if gap_size > 0.5 * atr_val:
+                conf += 1
+            if disp_range > 1.5 * atr_val:
+                conf += 1
+            conf = min(conf, 10)
+
+            ts = df.index[i].timestamp() if hasattr(df.index[i], "timestamp") else time.time()
+            signals.append(Signal(
+                id=f"nas_cont_{i}_{int(ts)}", strategy="continuation_nasdaq",
+                direction="buy", entry=entry, stop_loss=sl, take_profit=tp,
+                risk_reward=round(rr, 2), confidence=conf,
+                reason=f"Nasdaq Bull FVG retest @ ${entry:,.0f} (ADX {adx.iloc[i]:.0f}, RVOL {rvol.iloc[i]:.1f}x)",
+                timestamp=ts, bar_index=i,
+                metadata={"atr": atr_val, "adx": adx.iloc[i], "rvol": rvol.iloc[i], "strategy": "nasdaq"},
+            ))
+            expired_bull.append(fvg_bar)
+            break
+
+        for fb in expired_bull:
+            armed_bull.pop(fb, None)
+
+        # ── Check bearish retests ──
+        expired_bear = []
+        for fvg_bar, (limit_price, fvg_top, armed_bar, disp_range) in armed_bear.items():
+            bars_elapsed = i - armed_bar
+            if bars_elapsed > retest_max_bars:
+                expired_bear.append(fvg_bar)
+                continue
+            if df["high"].iloc[i] > fvg_top:
+                expired_bear.append(fvg_bar)
+                continue
+            if not (df["low"].iloc[i] <= limit_price <= df["high"].iloc[i]):
+                continue
+            if rvol.iloc[i] < rvol_multiplier:
+                expired_bear.append(fvg_bar)
+                continue
+
+            atr_val = atr.iloc[i]
+            entry = limit_price
+            sl = entry + atr_val * atr_sl_mult
+            risk = sl - entry
+            tp = entry - risk * rr_ratio
+            if risk <= 0 or (entry - tp) / risk < 1.5:
+                continue
+
+            # IRL target
+            irl = find_irl_target("sell", i, entry, tp, df["high"].values, df["low"].values)
+            if not np.isnan(irl) and irl > tp:
+                tp = irl
+
+            rr = (entry - tp) / risk
+            if rr < 1.5:
+                expired_bear.append(fvg_bar)
+                continue
+
+            # Confidence
+            conf = 5
+            if adx.iloc[i] > 30:
+                conf += 2
+            elif adx.iloc[i] > 25:
+                conf += 1
+            if rvol.iloc[i] > 1.5:
+                conf += 1
+            gap_size = fvg_top - limit_price
+            if gap_size > 0.5 * atr_val:
+                conf += 1
+            if disp_range > 1.5 * atr_val:
+                conf += 1
+            conf = min(conf, 10)
+
+            ts = df.index[i].timestamp() if hasattr(df.index[i], "timestamp") else time.time()
+            signals.append(Signal(
+                id=f"nas_cont_{i}_{int(ts)}", strategy="continuation_nasdaq",
+                direction="sell", entry=entry, stop_loss=sl, take_profit=tp,
+                risk_reward=round(rr, 2), confidence=conf,
+                reason=f"Nasdaq Bear FVG retest @ ${entry:,.0f} (ADX {adx.iloc[i]:.0f}, RVOL {rvol.iloc[i]:.1f}x)",
+                timestamp=ts, bar_index=i,
+                metadata={"atr": atr_val, "adx": adx.iloc[i], "rvol": rvol.iloc[i], "strategy": "nasdaq"},
+            ))
+            expired_bear.append(fvg_bar)
+            break
+
+        for fb in expired_bear:
+            armed_bear.pop(fb, None)
+
+    return signals
+
+
 # ── Backtest simulator ────────────────────────────────────
 
 def backtest_continuation(df: pd.DataFrame, **kwargs) -> dict:
