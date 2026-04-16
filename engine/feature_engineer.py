@@ -25,7 +25,7 @@ def extract_features(
     Args:
         df: OHLCV dataframe for this pair.
         signal: The strategy signal.
-        pair: "EUR/USD", "GBP/USD", or "USD/JPY".
+        pair: "EUR/USD", "GBP/USD", "USD/JPY", or "NAS100_USD".
         prior_outcomes: list of last N trade outcomes (1=win, 0=loss) for streak detection.
 
     Returns:
@@ -43,8 +43,19 @@ def extract_features(
 
     # ── Primary signal features ──
     direction_buy = 1 if signal.direction == "buy" else 0
-    pip_size = 0.01 if "JPY" in pair else 0.0001
-    pip_risk = abs(signal.entry - signal.stop_loss) / pip_size
+
+    # Risk distance: for forex in pips, for indices in points
+    # Normalize to a unit-agnostic "risk units" (pips for forex, points for indices)
+    if "NAS100" in pair or "US100" in pair:
+        # Nasdaq: 1 point = 1 unit, SL typically 50-100 points
+        risk_units = abs(signal.entry - signal.stop_loss)
+    elif "JPY" in pair:
+        # JPY pairs: 0.01 = 1 pip
+        risk_units = abs(signal.entry - signal.stop_loss) / 0.01
+    else:
+        # Forex majors: 0.0001 = 1 pip
+        risk_units = abs(signal.entry - signal.stop_loss) / 0.0001
+
     rr_ratio = signal.risk_reward
     confidence = signal.confidence
 
@@ -107,15 +118,34 @@ def extract_features(
         else:
             break
 
-    # ── Pair one-hot ──
+    # ── Instrument one-hot ──
     is_eur = 1 if pair == "EUR/USD" else 0
     is_gbp = 1 if pair == "GBP/USD" else 0
     is_jpy = 1 if pair == "USD/JPY" else 0
+    is_nas = 1 if ("NAS100" in pair or "US100" in pair) else 0
+
+    # ── Session context (different for Nasdaq vs forex) ──
+    # For Nasdaq: killzone (08:30-11:00 ET) and power hour (15:00-16:00 ET)
+    # For forex: London, NY, Asia sessions in UTC
+    if is_nas:
+        # Nasdaq sessions (ET times)
+        # Note: df.index is in UTC; convert hour to ET by subtracting 4 (EDT) or 5 (EST)
+        # For simplicity, assume EDT (UTC-4) — adjust if needed
+        et_hour = (hour_utc - 4) % 24
+        in_premarket = 1 if 4 <= et_hour < 9 else 0  # 08:00-13:00 UTC = 04:00-09:00 ET
+        in_killzone = 1 if 13 <= et_hour < 16 else 0  # 13:00-16:00 UTC = 09:00-12:00 ET (main window)
+        in_lunch = 1 if 16 <= et_hour < 17 else 0     # 16:00-17:00 UTC = 12:00-13:00 ET (chop)
+        in_afternoon = 1 if 19 <= et_hour < 20 else 0  # 19:00-20:00 UTC = 15:00-16:00 ET (power hour)
+        # Use these for Nasdaq
+        session_1, session_2, session_3, session_4 = in_killzone, in_lunch, in_afternoon, in_premarket
+    else:
+        # Forex sessions (UTC)
+        session_1, session_2, session_3, session_4 = in_london, in_ny, in_asia, in_ln_ny_overlap
 
     return {
         # Signal
         "direction_buy": direction_buy,
-        "pip_risk": float(pip_risk),
+        "risk_units": float(risk_units),
         "rr_ratio": float(rr_ratio),
         "confidence": int(confidence),
         # Indicators
@@ -128,10 +158,10 @@ def extract_features(
         # Temporal
         "hour_utc": hour_utc,
         "day_of_week": day_of_week,
-        "in_london": in_london,
-        "in_ny": in_ny,
-        "in_asia": in_asia,
-        "in_ln_ny_overlap": in_ln_ny_overlap,
+        "session_1": session_1,
+        "session_2": session_2,
+        "session_3": session_3,
+        "session_4": session_4,
         # Price position
         "position_in_range": float(position_in_range),
         # Momentum
@@ -140,21 +170,22 @@ def extract_features(
         # Prior outcomes
         "recent_win_rate": float(recent_win_rate),
         "consec_losses": int(consec_losses),
-        # Pair
+        # Instrument
         "is_eur_usd": is_eur,
         "is_gbp_usd": is_gbp,
         "is_usd_jpy": is_jpy,
+        "is_nasdaq": is_nas,
     }
 
 
 FEATURE_COLUMNS = [
-    "direction_buy", "pip_risk", "rr_ratio", "confidence",
+    "direction_buy", "risk_units", "rr_ratio", "confidence",
     "adx", "rvol", "atr_pct",
     "vol_regime_high", "vol_regime_low",
     "hour_utc", "day_of_week",
-    "in_london", "in_ny", "in_asia", "in_ln_ny_overlap",
+    "session_1", "session_2", "session_3", "session_4",
     "position_in_range",
     "recent_return_norm", "dist_from_ema_pct",
     "recent_win_rate", "consec_losses",
-    "is_eur_usd", "is_gbp_usd", "is_usd_jpy",
+    "is_eur_usd", "is_gbp_usd", "is_usd_jpy", "is_nasdaq",
 ]

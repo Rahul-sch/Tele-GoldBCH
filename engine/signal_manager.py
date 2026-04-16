@@ -27,9 +27,16 @@ class SignalManager:
         for sig in resolved:
             self._active_signals[sig.id] = sig
             self._signal_history.append(sig)
-            log.info("Signal approved: %s %s %s @ $%.0f (R:R %.1f, conf %d)",
+            # Format price by magnitude: BTC -> $X.XX, JPY -> X.XXX, majors -> X.XXXXX
+            if sig.entry >= 1000:
+                price_str = f"${sig.entry:,.2f}"
+            elif sig.entry >= 50:
+                price_str = f"{sig.entry:.3f}"
+            else:
+                price_str = f"{sig.entry:.5f}"
+            log.info("Signal approved: %s %s %s @ %s (R:R %.1f, conf %d)",
                      sig.strategy, sig.direction.upper(), sig.symbol,
-                     sig.entry, sig.risk_reward, sig.confidence)
+                     price_str, sig.risk_reward, sig.confidence)
         return resolved
 
     def _deduplicate(self, signals: list[Signal]) -> list[Signal]:

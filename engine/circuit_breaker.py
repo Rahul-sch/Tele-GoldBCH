@@ -49,11 +49,11 @@ class CircuitState:
 class CircuitBreaker:
     """Risk-management circuit breaker. Call check() before placing trades."""
 
-    # Tunables
+    # Tunables — sized for 2.5% risk per trade
     MAX_CONSEC_LOSSES = 4              # cooldown after this many consecutive losses
     COOLDOWN_HOURS = 1                 # how long to pause after consec-loss trip
-    DAILY_DD_PCT = 0.01                # halt if down 1% of starting equity for the day
-    WEEKLY_DD_PCT = 0.05               # halt if down 5% of starting equity for the week
+    DAILY_DD_PCT = 0.08                # halt if down 8% of starting equity for the day (~3 losses at 2.5%)
+    WEEKLY_DD_PCT = 0.15               # halt if down 15% of starting equity for the week
 
     def __init__(self) -> None:
         self.state = self._load()

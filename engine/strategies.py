@@ -42,9 +42,27 @@ class Signal:
 
     @property
     def fingerprint(self) -> str:
-        """Unique ID for dedup: strategy + direction + entry zone."""
-        entry_zone = round(self.entry / 50) * 50  # round to $50 buckets for BTC
-        return f"{self.strategy}:{self.direction}:{entry_zone}"
+        """Unique ID for dedup: strategy + symbol + direction + price bucket.
+
+        Bucket width scales with price magnitude so dedup works across
+        BTC ($1000s), JPY pairs (~150), and forex majors (~1.0):
+          - >= $1000:  $50 bucket (BTC/equities)
+          - 50-1000:   0.5 bucket (~50 pips for JPY pairs)
+          - 1-50:      0.001 bucket (~10 pips for majors)
+          - < 1:       0.0001 bucket (sub-1 pairs)
+        """
+        if self.entry >= 1000:
+            bucket_width = 50.0
+        elif self.entry >= 50:
+            bucket_width = 0.5
+        elif self.entry >= 1:
+            bucket_width = 0.001
+        elif self.entry > 0:
+            bucket_width = 0.0001
+        else:
+            return f"{self.strategy}:{self.symbol}:{self.direction}:0"
+        bucket = round(self.entry / bucket_width) * bucket_width
+        return f"{self.strategy}:{self.symbol}:{self.direction}:{bucket:.5f}"
 
     @property
     def risk_usd(self) -> float:

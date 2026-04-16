@@ -17,7 +17,7 @@ import asyncio
 import signal
 import sys
 
-from config.settings import SYMBOL, TIMEFRAME, TV_ENABLED, OPTIMIZER_RUN_HOUR, FOREX_PAIRS
+from config.settings import SYMBOL, TIMEFRAME, TV_ENABLED, OPTIMIZER_RUN_HOUR, FOREX_PAIRS, RISK_PER_TRADE
 from engine.strategies import run_all_strategies
 from engine.signal_manager import SignalManager
 from data.tradingview_feed import TradingViewFeed
@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-tv", action="store_true", help="Skip TradingView feed")
     p.add_argument("--symbol", default=SYMBOL, help=f"Symbol (default: {SYMBOL})")
     p.add_argument("--timeframe", default=TIMEFRAME, help=f"Timeframe (default: {TIMEFRAME})")
-    p.add_argument("--instrument", choices=["btc", "forex", "both"], default="btc",
-                   help="btc=Alpaca crypto, forex=OANDA forex pairs, both=run all")
+    p.add_argument("--instrument", choices=["btc", "forex", "both", "nasdaq"], default="btc",
+                   help="btc=Alpaca crypto, forex=OANDA forex, nasdaq=OANDA NAS100, both=BTC+forex")
     return p.parse_args()
 
 
@@ -171,8 +171,8 @@ async def run_forex_cycle(
         trader.close()
         return
     risk_mgr.update_equity(live_equity)
-    log.info("=== Live OANDA NAV: $%.2f | Risk per trade: $%.2f (0.25%%) ===",
-             live_equity, live_equity * 0.0025)
+    log.info("=== Live OANDA NAV: $%.2f | Risk per trade: $%.2f (%.2f%%) ===",
+             live_equity, live_equity * RISK_PER_TRADE, RISK_PER_TRADE * 100)
 
     # ── CIRCUIT BREAKER CHECK ──
     can_trade_now, breaker_reason = breaker.check(live_equity)
@@ -237,6 +237,11 @@ async def run_forex_cycle(
         # only on forex. Goldbach Bounce stays enabled for BTC where it works.
         signals = strategy_continuation(df)
 
+        # Set symbol on each signal — defaults to "BTC/USDT", needs to be the actual pair
+        # for correct dedup fingerprints, telegram alerts, and logs.
+        for s in signals:
+            s.symbol = pair
+
         # CRITICAL: Only act on signals from the last 2 bars (current + previous)
         # Older signals have stale entries where SL may already be behind price
         last_bar = len(df) - 1
@@ -283,21 +288,23 @@ async def run_forex_cycle(
                 continue
 
             # ── DYNAMIC POSITION SIZING ────────────────────────
-            # Risk = 0.25% of LIVE OANDA NAV (fetched at cycle start).
+            # Risk = RISK_PER_TRADE of LIVE OANDA NAV (fetched at cycle start).
             # Compounds gains automatically, shrinks during drawdown.
+            risk_amount = live_equity * RISK_PER_TRADE
+
+            # Forex: sizing in standard lots (100K units)
             pip_size = 0.01 if "JPY" in pair else 0.0001
             pip_value = 6.5 if "JPY" in pair else 10.0  # USD per pip per standard lot
-            risk_amount = live_equity * 0.0025  # 0.25% of LIVE equity
             risk_pips = abs(sig.entry - sig.stop_loss) / pip_size
             if risk_pips <= 0 or risk_pips > 200:
                 continue
             lots = risk_amount / (risk_pips * pip_value)
-            lots = min(lots, 3.0)  # cap at 3 standard lots (prop firm safe)
+            lots = min(lots, 30.0)  # cap at 30 standard lots
             units = int(lots * 100_000)
             if units < 1000:
                 continue
-            log.info("%s: %.1f pip risk | %.2f lots (%d units) | $%.2f at risk (0.25%% of $%.2f NAV)",
-                     pair, risk_pips, lots, units, risk_amount, live_equity)
+            log.info("%s: %.1f pip risk | %.2f lots (%d units) | $%.2f at risk (%.2f%% of $%.2f NAV)",
+                     pair, risk_pips, lots, units, risk_amount, RISK_PER_TRADE * 100, live_equity)
 
             display_signal(sig)
             log_signal(sig)
@@ -336,12 +343,172 @@ async def run_forex_cycle(
     except Exception as exc:
         log.debug("Heartbeat write failed: %s", exc)
 
-    # Push live state to Upstash Redis for mobile dashboard (non-blocking)
+    # Push live state to Upstash Redis for mobile dashboard (non-blocking, 5s timeout)
     try:
         from cloud_sync import sync_now
-        await sync_now()
+        await asyncio.wait_for(sync_now(), timeout=5.0)
+    except asyncio.TimeoutError:
+        log.warning("Cloud sync timed out after 5s — skipping this cycle")
     except Exception as exc:
         log.debug("Cloud sync skipped: %s", exc)
+
+
+async def run_nasdaq_cycle(
+    signal_mgr: SignalManager,
+    pos_mgr: PositionManager,
+    risk_mgr: "RiskManager",
+) -> None:
+    """Run analysis on NAS100 via OANDA. Nasdaq-specific session gating + earnings blackout."""
+    from data.oanda_feed import fetch_forex_candles
+    from execution.oanda_trader import OandaTrader
+    from engine.continuation import strategy_continuation, compute_rvol, compute_adx
+    from engine.earnings_calendar import is_earnings_blackout_nasdaq
+    from engine.meta_filter import should_take_signal, load_prior_outcomes
+    from engine.circuit_breaker import get_breaker
+    from execution.position_monitor import manage_open_positions
+    from execution.closure_detector import detect_new_closures
+    from output import telegram_alerts as tg
+    from config.settings import (
+        OANDA_TOKEN, OANDA_ACCOUNT_ID, OANDA_ENVIRONMENT,
+        NASDAQ_SYMBOL, NASDAQ_RISK_PER_TRADE, NASDAQ_ADX_THRESHOLD,
+        NASDAQ_RVOL_PERIOD,
+    )
+
+    prior_outcomes = load_prior_outcomes()
+    breaker = get_breaker()
+    trader = OandaTrader()
+
+    # ── Check earnings blackout ──
+    is_blackout, blackout_reason = is_earnings_blackout_nasdaq()
+    if is_blackout:
+        log.warning("NASDAQ EARNINGS BLACKOUT — %s. Skipping new entries.", blackout_reason)
+        await tg.alert_circuit_breaker(f"Earnings Blackout: {blackout_reason}", {})
+        trader.close()
+        return
+
+    # ── DYNAMIC EQUITY FETCH ────────────────────────────────
+    live_equity = await trader.get_nav()
+    if live_equity <= 0:
+        log.error("Could not fetch live equity from OANDA — aborting Nasdaq cycle")
+        trader.close()
+        return
+    risk_mgr.update_equity(live_equity)
+    log.info("=== Live OANDA NAV: $%.2f | Nasdaq risk per trade: $%.2f (%.2f%%) ===",
+             live_equity, live_equity * NASDAQ_RISK_PER_TRADE, NASDAQ_RISK_PER_TRADE * 100)
+
+    # ── CIRCUIT BREAKER CHECK ──
+    can_trade_now, breaker_reason = breaker.check(live_equity)
+    if not can_trade_now:
+        log.warning("CIRCUIT BREAKER TRIPPED — %s. Skipping Nasdaq entries.", breaker_reason)
+        await tg.alert_circuit_breaker(breaker_reason, breaker.status(live_equity))
+        trader.close()
+        return
+
+    # ── Fetch US100 candles ──
+    df = await fetch_forex_candles(symbol=NASDAQ_SYMBOL, timeframe="15m", limit=100)
+    if df is None or df.empty:
+        log.warning("No US100 data available — skipping Nasdaq cycle")
+        trader.close()
+        return
+
+    # ── DETECT NEW CLOSURES (record outcomes) ──
+    new_closures = await detect_new_closures(OANDA_TOKEN, OANDA_ACCOUNT_ID, OANDA_ENVIRONMENT)
+    for closure in new_closures:
+        emoji = "✅" if closure["label"] == 1 else "❌"
+        await tg._send(
+            f"{emoji} <b>NASDAQ TRADE CLOSED</b>\n"
+            f"{closure['instrument']} {closure['direction'].upper()}\n"
+            f"PnL: ${closure['pnl']:+.2f}"
+        )
+
+    # ── MANAGE OPEN POSITIONS ──
+    sl_actions = await manage_open_positions(trader, {NASDAQ_SYMBOL: df})
+    for action in sl_actions:
+        await tg.alert_sl_modified(action)
+
+    # Get open positions
+    open_positions = await trader.get_open_trades()
+
+    # ── GENERATE SIGNALS ──
+    # Use Nasdaq-specific parameters: higher ADX threshold, longer RVOL period
+    signals = strategy_continuation(
+        df,
+        adx_threshold=NASDAQ_ADX_THRESHOLD,  # 22 instead of 18
+    )
+
+    # Set symbol
+    for s in signals:
+        s.symbol = NASDAQ_SYMBOL
+
+    # Only act on signals from the last 2 bars (fresh)
+    last_bar = len(df) - 1
+    fresh_signals = [s for s in signals if s.bar_index >= last_bar - 1]
+    log.info("%s: %d total signals, %d fresh", NASDAQ_SYMBOL, len(signals), len(fresh_signals))
+
+    actionable = signal_mgr.process_signals(fresh_signals)
+    current_price = df["close"].iloc[-1]
+
+    for sig in actionable:
+        # Validate SL
+        if sig.direction == "buy" and (sig.stop_loss >= sig.entry or sig.stop_loss >= current_price):
+            log.info("Skipped %s: invalid SL", sig.id)
+            continue
+        if sig.direction == "sell" and (sig.stop_loss <= sig.entry or sig.stop_loss <= current_price):
+            log.info("Skipped %s: invalid SL", sig.id)
+            continue
+
+        # ── META-MODEL FILTER ──
+        take, prob = should_take_signal(df, sig, NASDAQ_SYMBOL, prior_outcomes=prior_outcomes)
+        if prob is not None:
+            log.info("%s: meta-model p(win)=%.2f", NASDAQ_SYMBOL, prob)
+            if not take:
+                log.info("META BLOCK: %s — p(win)=%.2f below threshold", sig.id, prob)
+                continue
+
+        allowed, reason = risk_mgr.can_trade(sig, allow_shorts=True)
+        if not allowed:
+            log.info("Risk blocked: %s — %s", sig.id, reason)
+            continue
+
+        # ── POSITION SIZING FOR NASDAQ ──
+        # 1 unit of US100 CFD = $1 per point
+        # Risk = NASDAQ_RISK_PER_TRADE * NAV
+        risk_amount = live_equity * NASDAQ_RISK_PER_TRADE
+        point_distance = abs(sig.entry - sig.stop_loss)
+        if point_distance <= 0 or point_distance > 200:
+            log.info("Skipped %s: point distance %.2f out of range", sig.id, point_distance)
+            continue
+
+        # units = risk_amount / point_distance
+        # With $2,500 NAV, 1% risk = $25, 50-point SL = $25/50 = 0.5 units
+        # Round up to 1 unit (minimum) or down if too large
+        units = max(1.0, risk_amount / point_distance)
+        units = min(units, 10.0)  # cap at 10 units per trade
+
+        log.info("%s: %.1f-point risk | %.1f units | $%.2f at risk (%.2f%% of $%.2f NAV)",
+                 NASDAQ_SYMBOL, point_distance, units, risk_amount,
+                 NASDAQ_RISK_PER_TRADE * 100, live_equity)
+
+        display_signal(sig)
+        log_signal(sig)
+        await tg.alert_signal(sig)
+
+        # Place order via OANDA
+        order = await trader.place_market_order(sig, int(units), NASDAQ_SYMBOL)
+        if order:
+            fill_price = order.get("average", sig.entry)
+            pos_mgr.open_position(
+                signal_id=sig.id, order_id=order["id"],
+                direction=sig.direction, entry=fill_price,
+                size=units, stop_loss=sig.stop_loss,
+                take_profit=sig.take_profit, strategy=sig.strategy,
+            )
+            log_fill(sig, int(units), fill_price)
+            await tg.alert_fill(sig, int(units), fill_price)
+            signal_mgr.mark_filled(sig.id)
+
+    trader.close()
+    console.print(f"[dim]Nasdaq scan complete[/]")
 
 
 async def run_live(args: argparse.Namespace) -> None:
@@ -354,6 +521,8 @@ async def run_live(args: argparse.Namespace) -> None:
         console.print(f"  BTC Symbol: {args.symbol} (Alpaca)")
     if mode in ("forex", "both"):
         console.print(f"  Forex:      {', '.join(FOREX_PAIRS)} (OANDA)")
+    if mode == "nasdaq":
+        console.print(f"  Nasdaq:     NAS100_USD (OANDA)")
     console.print(f"  Timeframe:  {args.timeframe}")
     console.print(f"  Sessions:   {args.session}")
     console.print()
@@ -413,6 +582,8 @@ async def run_live(args: argparse.Namespace) -> None:
                     )
                 if mode in ("forex", "both"):
                     await run_forex_cycle(signal_mgr, pos_mgr, risk_mgr)
+                if mode == "nasdaq":
+                    await run_nasdaq_cycle(signal_mgr, pos_mgr, risk_mgr)
                 await asyncio.sleep(candle_seconds)
             else:
                 # Check if we should run optimizer (midnight)
@@ -469,6 +640,8 @@ async def run_once(args: argparse.Namespace) -> None:
         await run_analysis_cycle(signal_mgr, paper_trader, pos_mgr, risk_mgr, None, args.symbol, args.timeframe)
     if mode in ("forex", "both"):
         await run_forex_cycle(signal_mgr, pos_mgr, risk_mgr)
+    if mode == "nasdaq":
+        await run_nasdaq_cycle(signal_mgr, pos_mgr, risk_mgr)
     if paper_trader is not None:
         paper_trader.close()
 

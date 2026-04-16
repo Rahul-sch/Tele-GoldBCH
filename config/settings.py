@@ -30,6 +30,19 @@ OANDA_ACCOUNT_ID: str = _get("OANDA_ACCOUNT_ID", "")
 OANDA_ENVIRONMENT: str = _get("OANDA_ENVIRONMENT", "practice")  # "practice" or "live"
 FOREX_PAIRS: list = _get("FOREX_PAIRS", "EUR/USD,GBP/USD,AUD/USD,USD/JPY").split(",")
 
+# ── OANDA Nasdaq (US100/NAS100) ──────────────────────────
+NASDAQ_ENABLED: bool = _get("NASDAQ_ENABLED", "false").lower() == "true"
+NASDAQ_SYMBOL: str = _get("NASDAQ_SYMBOL", "NAS100_USD")
+NASDAQ_RISK_PER_TRADE: float = float(_get("NASDAQ_RISK_PER_TRADE", "0.01"))  # 1% for indices
+NASDAQ_ADX_THRESHOLD: float = float(_get("NASDAQ_ADX_THRESHOLD", "22.0"))
+NASDAQ_RVOL_PERIOD: int = int(_get("NASDAQ_RVOL_PERIOD", "20"))
+NASDAQ_SESSION_START_ET: str = _get("NASDAQ_SESSION_START_ET", "08:30")
+NASDAQ_SESSION_END_ET: str = _get("NASDAQ_SESSION_END_ET", "16:00")
+NASDAQ_LUNCH_START_ET: str = _get("NASDAQ_LUNCH_START_ET", "12:00")
+NASDAQ_LUNCH_END_ET: str = _get("NASDAQ_LUNCH_END_ET", "13:00")
+NASDAQ_POWER_HOUR_START_ET: str = _get("NASDAQ_POWER_HOUR_START_ET", "15:00")
+NASDAQ_POWER_HOUR_END_ET: str = _get("NASDAQ_POWER_HOUR_END_ET", "16:00")
+
 # ── Trading ───────────────────────────────────────────────
 SYMBOL: str = _get("SYMBOL", "BTC/USD")
 TIMEFRAME: str = _get("TIMEFRAME", "15m")

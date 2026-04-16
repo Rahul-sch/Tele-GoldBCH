@@ -131,7 +131,7 @@ class PositionManager:
 
             # Break-even logic
             if not pos.break_even_moved and pos.progress_to_target >= BREAK_EVEN_TRIGGER:
-                buffer = abs(pos.entry - pos.stop_loss) * 0.05  # tiny buffer above entry
+                buffer = abs(pos.entry - pos.stop_loss) * 0.15  # buffer above entry (15% of risk distance)
                 if pos.direction == "buy":
                     new_sl = pos.entry + buffer
                 else:

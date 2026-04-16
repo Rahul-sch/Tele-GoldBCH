@@ -34,6 +34,11 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def compute_rvol(df: pd.DataFrame, period: int = 10) -> pd.Series:
+    """Relative volume (current vol / SMA of recent vol).
+
+    Args:
+        period: lookback window for volume MA. Default 10 for M15, adjust to 20 for Nasdaq.
+    """
     vol_sma = df["volume"].rolling(period).mean()
     return (df["volume"] / vol_sma.replace(0, np.nan)).fillna(0)
 
@@ -93,6 +98,171 @@ def find_irl_target(direction: str, bar_idx: int, entry: float, tp: float,
     return min(candidates) if direction == "buy" else max(candidates)
 
 
+def has_recent_sweep(
+    direction: str,
+    bar_idx: int,
+    high_arr: np.ndarray,
+    low_arr: np.ndarray,
+    close_arr: np.ndarray,
+    atr: float,
+    sweep_window: int = 10,
+    lookback: int = 20,
+    equal_tol: float = 0.2,
+    min_touches: int = 2,
+) -> bool:
+    """Detect recent liquidity sweep — the ICT core edge.
+
+    Bull sweep: in last `sweep_window` bars, a wick pierced below a cluster of
+    >=min_touches prior equal-lows AND closed back above them (failed breakdown
+    = institutional accumulation). For bear: mirror.
+
+    This is the ICT "stop hunt then reversal" pattern. FVGs that form AFTER
+    a sweep have much higher probability of holding (the sweep cleared the
+    opposing liquidity; institutions are now positioned in trade direction).
+    """
+    if atr <= 0:
+        return False
+    search_start = max(0, bar_idx - sweep_window)
+
+    for k in range(search_start, bar_idx):
+        if direction == "bull":
+            sweep_low = low_arr[k]
+            sweep_close = close_arr[k]
+            # Close must recover above the sweep level (rejection wick)
+            if sweep_close <= sweep_low + 0.1 * atr:
+                continue
+            # Count prior lows above but near the sweep point (equal-lows cluster)
+            lookback_start = max(0, k - lookback)
+            touches = sum(
+                1 for j in range(lookback_start, k)
+                if sweep_low < low_arr[j] < sweep_low + equal_tol * atr
+            )
+            if touches >= min_touches:
+                return True
+        else:  # bear
+            sweep_high = high_arr[k]
+            sweep_close = close_arr[k]
+            if sweep_close >= sweep_high - 0.1 * atr:
+                continue
+            lookback_start = max(0, k - lookback)
+            touches = sum(
+                1 for j in range(lookback_start, k)
+                if sweep_high - equal_tol * atr < high_arr[j] < sweep_high
+            )
+            if touches >= min_touches:
+                return True
+    return False
+
+
+def has_order_block(
+    direction: str,
+    bar_idx: int,
+    open_arr: np.ndarray,
+    close_arr: np.ndarray,
+    lookback: int = 3,
+) -> bool:
+    """Check for an order block — the last opposing candle before displacement.
+
+    Bullish FVG with OB confluence: in the `lookback` bars before bar_idx,
+    at least one bar must be a BEARISH candle (close < open). This identifies
+    the institutional accumulation zone — the last down-close before the
+    reversal impulse that created the FVG.
+
+    Bearish FVG: require at least one BULLISH candle (close > open) in the
+    lookback window.
+
+    Without OB confluence, the displacement is "free-floating" without a clear
+    institutional footprint — lower quality per ICT theory.
+    """
+    start = max(0, bar_idx - lookback)
+    for k in range(start, bar_idx):
+        if direction == "bull":
+            if close_arr[k] < open_arr[k]:  # bearish candle
+                return True
+        else:  # bear
+            if close_arr[k] > open_arr[k]:  # bullish candle
+                return True
+    return False
+
+
+def find_liquidity_target(
+    direction: str,
+    bar_idx: int,
+    entry: float,
+    sl: float,
+    high_arr: np.ndarray,
+    low_arr: np.ndarray,
+    atr: float,
+    min_rr: float = 2.0,
+    max_rr: float = 4.0,
+    pivot_bars: int = 3,
+    lookback: int = 100,
+    equal_tol: float = 0.15,
+) -> float:
+    """Find best liquidity pool for TP — weighted by confluence and recency.
+
+    Scans for pivot highs (buy direction) or pivot lows (sell direction) within
+    min_rr to max_rr distance from entry. Ranks candidates by:
+      - Confluence: number of touches within equal_tol * ATR of the level
+        (equal highs / equal lows = stronger magnet, per ICT liquidity theory)
+      - Recency: more recent levels preferred (weight 0.7-1.0)
+
+    Returns the highest-scoring level price, or NaN if no suitable level exists.
+    When NaN, caller should fall back to the default R-multiple target.
+    """
+    risk = abs(entry - sl)
+    if risk <= 0 or atr <= 0:
+        return float("nan")
+
+    min_dist = risk * min_rr
+    max_dist = risk * max_rr
+    n = len(high_arr)
+    start = max(pivot_bars, bar_idx - lookback)
+    end = max(pivot_bars, bar_idx - pivot_bars)
+    if end <= start:
+        return float("nan")
+
+    candidates: list[tuple[float, float]] = []  # (level, score)
+
+    for j in range(start, end):
+        if j - pivot_bars < 0 or j + pivot_bars >= n:
+            continue
+
+        if direction == "buy":
+            is_pivot = (all(high_arr[j] >= high_arr[j - k] for k in range(1, pivot_bars + 1))
+                        and all(high_arr[j] >= high_arr[j + k] for k in range(1, pivot_bars + 1)))
+            if not is_pivot:
+                continue
+            level = float(high_arr[j])
+            if not (entry + min_dist < level < entry + max_dist):
+                continue
+            # Count nearby touches (equal-highs cluster = strong liquidity pool)
+            touches = sum(1 for k in range(start, bar_idx)
+                          if abs(high_arr[k] - level) < equal_tol * atr)
+            recency = 1.0 - (bar_idx - j) / lookback * 0.3
+            score = touches * recency
+            candidates.append((level, score))
+        else:  # sell
+            is_pivot = (all(low_arr[j] <= low_arr[j - k] for k in range(1, pivot_bars + 1))
+                        and all(low_arr[j] <= low_arr[j + k] for k in range(1, pivot_bars + 1)))
+            if not is_pivot:
+                continue
+            level = float(low_arr[j])
+            if not (entry - max_dist < level < entry - min_dist):
+                continue
+            touches = sum(1 for k in range(start, bar_idx)
+                          if abs(low_arr[k] - level) < equal_tol * atr)
+            recency = 1.0 - (bar_idx - j) / lookback * 0.3
+            score = touches * recency
+            candidates.append((level, score))
+
+    if not candidates:
+        return float("nan")
+
+    best_level, _ = max(candidates, key=lambda x: x[1])
+    return best_level
+
+
 # ── Continuation Strategy ─────────────────────────────────
 
 def strategy_continuation(
@@ -102,7 +272,10 @@ def strategy_continuation(
     displacement_threshold: float = 1.0,
     retest_max_bars: int = 5,
     adx_threshold: float = 18.0,
-    rvol_multiplier: float = 1.2,
+    rvol_multiplier: float = 1.0,
+    require_sweep: bool = False,
+    require_orderblock: bool = False,
+    sweep_window: int = 10,
 ) -> list[Signal]:
     """ICT FVG continuation retest strategy adapted for BTC.
 
@@ -122,11 +295,14 @@ def strategy_continuation(
     candle_range = df["high"] - df["low"]
     is_displacement = candle_range > (atr * displacement_threshold)
 
-    # Trend: 20-bar SMA slope
-    sma20 = df["close"].rolling(20).mean()
-    trend = pd.Series(0, index=df.index)
-    trend[sma20.diff() > 0] = 1
-    trend[sma20.diff() < 0] = -1
+    # Trend: 1H EMA slope (smoother than M15 SMA20, prevents whipsaws)
+    try:
+        trend = compute_htf_ema_signal(df)
+    except Exception:
+        sma20 = df["close"].rolling(20).mean()
+        trend = pd.Series(0, index=df.index)
+        trend[sma20.diff() > 0] = 1
+        trend[sma20.diff() < 0] = -1
 
     # FVGs
     bull_top, bull_bot, bear_top, bear_bot = detect_fvgs(df)
@@ -138,27 +314,61 @@ def strategy_continuation(
     for i in range(30, len(df)):
         # ── ARM bullish FVGs ──
         if not np.isnan(bull_top.iloc[i]) and is_displacement.iloc[i]:
-            if trend.iloc[i] == 1 and adx.iloc[i] >= adx_threshold:
+            gap_size = bull_top.iloc[i] - bull_bot.iloc[i]
+            is_bull_candle = df["close"].iloc[i] > df["open"].iloc[i]
+            if (trend.iloc[i] == 1
+                    and adx.iloc[i] >= adx_threshold
+                    and is_bull_candle
+                    and gap_size >= 0.3 * atr.iloc[i]
+                    and rvol.iloc[i] >= 1.0):
+                # Optional ICT filters
+                if require_sweep and not has_recent_sweep(
+                    "bull", i,
+                    df["high"].values, df["low"].values, df["close"].values,
+                    atr.iloc[i], sweep_window=sweep_window,
+                ):
+                    continue
+                if require_orderblock and not has_order_block(
+                    "bull", i, df["open"].values, df["close"].values,
+                ):
+                    continue
                 armed_bull[i] = (
                     float(bull_top.iloc[i]),  # limit price
                     float(bull_bot.iloc[i]),  # invalidation
                     i,                         # armed bar
-                    float(atr.iloc[i]),
+                    float(candle_range.iloc[i]),  # displacement size
                 )
 
         # ── ARM bearish FVGs ──
         if not np.isnan(bear_top.iloc[i]) and is_displacement.iloc[i]:
-            if trend.iloc[i] == -1 and adx.iloc[i] >= adx_threshold:
+            gap_size = bear_top.iloc[i] - bear_bot.iloc[i]
+            is_bear_candle = df["close"].iloc[i] < df["open"].iloc[i]
+            if (trend.iloc[i] == -1
+                    and adx.iloc[i] >= adx_threshold
+                    and is_bear_candle
+                    and gap_size >= 0.3 * atr.iloc[i]
+                    and rvol.iloc[i] >= 1.0):
+                # Optional ICT filters
+                if require_sweep and not has_recent_sweep(
+                    "bear", i,
+                    df["high"].values, df["low"].values, df["close"].values,
+                    atr.iloc[i], sweep_window=sweep_window,
+                ):
+                    continue
+                if require_orderblock and not has_order_block(
+                    "bear", i, df["open"].values, df["close"].values,
+                ):
+                    continue
                 armed_bear[i] = (
-                    float(bear_bot.iloc[i]),  # limit price (top of bear FVG)
+                    float(bear_bot.iloc[i]),  # limit price
                     float(bear_top.iloc[i]),  # invalidation
-                    i,
-                    float(atr.iloc[i]),
+                    i,                         # armed bar
+                    float(candle_range.iloc[i]),  # displacement size
                 )
 
         # ── Check bullish retests ──
         expired_bull = []
-        for fvg_bar, (limit_price, fvg_bot, armed_bar, atr_val) in armed_bull.items():
+        for fvg_bar, (limit_price, fvg_bot, armed_bar, disp_range) in armed_bull.items():
             bars_elapsed = i - armed_bar
             if bars_elapsed > retest_max_bars:
                 expired_bull.append(fvg_bar)
@@ -168,9 +378,12 @@ def strategy_continuation(
                 continue
             if not (df["low"].iloc[i] <= limit_price <= df["high"].iloc[i]):
                 continue
+            # FVG touched — expire if volume insufficient (gap no longer virgin)
             if rvol.iloc[i] < rvol_multiplier:
+                expired_bull.append(fvg_bar)
                 continue
 
+            atr_val = atr.iloc[i]  # use retest-bar ATR for SL sizing
             entry = limit_price
             sl = entry - atr_val * atr_sl_mult
             risk = entry - sl
@@ -178,17 +391,32 @@ def strategy_continuation(
             if risk <= 0 or (tp - entry) / risk < 1.5:
                 continue
 
-            # IRL target
+            # IRL target (cap TP at nearest swing high if closer than 3R)
             irl = find_irl_target("buy", i, entry, tp, df["high"].values, df["low"].values)
             if not np.isnan(irl) and irl < tp:
-                tp = irl  # Cap at IRL
+                tp = irl
+
+            # Re-check R:R after IRL cap
+            rr = (tp - entry) / risk
+            if rr < 1.5:
+                expired_bull.append(fvg_bar)
+                continue
+
+            # Confidence: multi-factor scoring
+            conf = 5
+            if adx.iloc[i] > 30: conf += 2
+            elif adx.iloc[i] > 25: conf += 1
+            if rvol.iloc[i] > 1.5: conf += 1
+            gap_size = limit_price - fvg_bot
+            if gap_size > 0.5 * atr_val: conf += 1
+            if disp_range > 1.5 * atr_val: conf += 1
+            conf = min(conf, 10)
 
             ts = df.index[i].timestamp() if hasattr(df.index[i], "timestamp") else time.time()
-            rr = (tp - entry) / risk
             signals.append(Signal(
                 id=f"cont_{i}_{int(ts)}", strategy="continuation",
                 direction="buy", entry=entry, stop_loss=sl, take_profit=tp,
-                risk_reward=round(rr, 2), confidence=8 if adx.iloc[i] > 25 else 6,
+                risk_reward=round(rr, 2), confidence=conf,
                 reason=f"Bull FVG retest @ ${entry:,.0f} (ADX {adx.iloc[i]:.0f}, RVOL {rvol.iloc[i]:.1f}x)",
                 timestamp=ts, bar_index=i,
                 metadata={"atr": atr_val, "adx": adx.iloc[i], "rvol": rvol.iloc[i]},
@@ -201,7 +429,7 @@ def strategy_continuation(
 
         # ── Check bearish retests ──
         expired_bear = []
-        for fvg_bar, (limit_price, fvg_top, armed_bar, atr_val) in armed_bear.items():
+        for fvg_bar, (limit_price, fvg_top, armed_bar, disp_range) in armed_bear.items():
             bars_elapsed = i - armed_bar
             if bars_elapsed > retest_max_bars:
                 expired_bear.append(fvg_bar)
@@ -211,9 +439,12 @@ def strategy_continuation(
                 continue
             if not (df["low"].iloc[i] <= limit_price <= df["high"].iloc[i]):
                 continue
+            # FVG touched — expire if volume insufficient (gap no longer virgin)
             if rvol.iloc[i] < rvol_multiplier:
+                expired_bear.append(fvg_bar)
                 continue
 
+            atr_val = atr.iloc[i]  # use retest-bar ATR for SL sizing
             entry = limit_price
             sl = entry + atr_val * atr_sl_mult
             risk = sl - entry
@@ -221,16 +452,32 @@ def strategy_continuation(
             if risk <= 0 or (entry - tp) / risk < 1.5:
                 continue
 
+            # IRL target (cap TP at nearest swing low if closer than 3R)
             irl = find_irl_target("sell", i, entry, tp, df["high"].values, df["low"].values)
             if not np.isnan(irl) and irl > tp:
                 tp = irl
 
-            ts = df.index[i].timestamp() if hasattr(df.index[i], "timestamp") else time.time()
+            # Re-check R:R after IRL cap
             rr = (entry - tp) / risk
+            if rr < 1.5:
+                expired_bear.append(fvg_bar)
+                continue
+
+            # Confidence: multi-factor scoring
+            conf = 5
+            if adx.iloc[i] > 30: conf += 2
+            elif adx.iloc[i] > 25: conf += 1
+            if rvol.iloc[i] > 1.5: conf += 1
+            gap_size = fvg_top - limit_price
+            if gap_size > 0.5 * atr_val: conf += 1
+            if disp_range > 1.5 * atr_val: conf += 1
+            conf = min(conf, 10)
+
+            ts = df.index[i].timestamp() if hasattr(df.index[i], "timestamp") else time.time()
             signals.append(Signal(
                 id=f"cont_{i}_{int(ts)}", strategy="continuation",
                 direction="sell", entry=entry, stop_loss=sl, take_profit=tp,
-                risk_reward=round(rr, 2), confidence=8 if adx.iloc[i] > 25 else 6,
+                risk_reward=round(rr, 2), confidence=conf,
                 reason=f"Bear FVG retest @ ${entry:,.0f} (ADX {adx.iloc[i]:.0f}, RVOL {rvol.iloc[i]:.1f}x)",
                 timestamp=ts, bar_index=i,
                 metadata={"atr": atr_val, "adx": adx.iloc[i], "rvol": rvol.iloc[i]},
