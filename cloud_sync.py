@@ -179,3 +179,54 @@ async def sync_now() -> bool:
     if not snap:
         return False
     return await push_state(**snap)
+
+
+# ── Bot Control via Redis ──────────────────────────────────
+
+async def push_bot_status(bot_name: str, status: str) -> bool:
+    """Push bot running status to Redis. Called by main.py each cycle.
+
+    Args:
+        bot_name: "forex" or "nasdaq"
+        status: "running", "stopped", or "error"
+    """
+    r = _get_redis()
+    if not r:
+        return False
+    try:
+        key = f"tele_goldbch:bot:{bot_name}:status"
+        value = json.dumps({
+            "status": status,
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        })
+        await asyncio.to_thread(r.set, key, value)
+        return True
+    except Exception as exc:
+        log.error("push_bot_status failed: %s", exc)
+        return False
+
+
+async def check_bot_command(bot_name: str) -> Optional[str]:
+    """Check if dashboard sent a start/stop command. Returns command or None.
+
+    Args:
+        bot_name: "forex" or "nasdaq"
+
+    Returns:
+        "start", "stop", or None if no pending command.
+    """
+    r = _get_redis()
+    if not r:
+        return None
+    try:
+        key = f"tele_goldbch:bot:{bot_name}:command"
+        raw = await asyncio.to_thread(r.get, key)
+        if not raw:
+            return None
+        cmd = json.loads(raw) if isinstance(raw, str) else raw
+        # Clear the command after reading (one-shot)
+        await asyncio.to_thread(r.delete, key)
+        return cmd.get("action") if isinstance(cmd, dict) else str(cmd)
+    except Exception as exc:
+        log.error("check_bot_command failed: %s", exc)
+        return None

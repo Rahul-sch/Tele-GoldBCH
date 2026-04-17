@@ -1,12 +1,45 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import type { TradingState } from "@/lib/redis";
+
+type BotStatus = {
+  forex: { status: string; updated_at: string | null };
+  nasdaq: { status: string; updated_at: string | null };
+};
 
 export default function Dashboard() {
   const [state, setState] = useState<TradingState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastFetch, setLastFetch] = useState<Date | null>(null);
+  const [botStatus, setBotStatus] = useState<BotStatus | null>(null);
+  const [sendingCommand, setSendingCommand] = useState<string | null>(null);
+
+  const fetchBotStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/api/bot", { cache: "no-store" });
+      if (res.ok) setBotStatus(await res.json());
+    } catch { /* silent */ }
+  }, []);
+
+  const sendBotCommand = useCallback(async (bot: string, action: string) => {
+    setSendingCommand(`${bot}-${action}`);
+    try {
+      await fetch("/api/bot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bot, action }),
+      });
+      // Optimistic update
+      setBotStatus((prev) => prev ? {
+        ...prev,
+        [bot]: { status: action === "start" ? "starting" : "stopping", updated_at: new Date().toISOString() },
+      } : prev);
+      // Refresh after a delay
+      setTimeout(fetchBotStatus, 3000);
+    } catch { /* silent */ }
+    finally { setSendingCommand(null); }
+  }, [fetchBotStatus]);
 
   useEffect(() => {
     const fetchState = async () => {
@@ -25,9 +58,11 @@ export default function Dashboard() {
       }
     };
     fetchState();
+    fetchBotStatus();
     const id = setInterval(fetchState, 10000);
-    return () => clearInterval(id);
-  }, []);
+    const id2 = setInterval(fetchBotStatus, 10000);
+    return () => { clearInterval(id); clearInterval(id2); };
+  }, [fetchBotStatus]);
 
   if (!state && !error) {
     return (
@@ -71,6 +106,27 @@ export default function Dashboard() {
             </div>
           </div>
         </header>
+
+        <section className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4 mb-6">
+          <BotControl
+            label="Forex Bot"
+            sub="EUR/USD, GBP/USD, USD/JPY"
+            status={botStatus?.forex?.status ?? "unknown"}
+            updatedAt={botStatus?.forex?.updated_at ?? null}
+            onStart={() => sendBotCommand("forex", "start")}
+            onStop={() => sendBotCommand("forex", "stop")}
+            loading={sendingCommand === "forex-start" || sendingCommand === "forex-stop"}
+          />
+          <BotControl
+            label="Nasdaq Bot"
+            sub="NAS100 FVG V3"
+            status={botStatus?.nasdaq?.status ?? "unknown"}
+            updatedAt={botStatus?.nasdaq?.updated_at ?? null}
+            onStart={() => sendBotCommand("nasdaq", "start")}
+            onStop={() => sendBotCommand("nasdaq", "stop")}
+            loading={sendingCommand === "nasdaq-start" || sendingCommand === "nasdaq-stop"}
+          />
+        </section>
 
         <section className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 mb-6">
           <KpiCard
@@ -207,6 +263,87 @@ function KpiCard({
       <div className="text-[10px] sm:text-xs uppercase tracking-wider text-neutral-500 font-semibold mb-1">{label}</div>
       <div className={`text-lg sm:text-2xl font-bold font-mono tabular-nums ${valueColor}`}>{value}</div>
       {sub && <div className={`text-[10px] sm:text-xs font-mono mt-1 ${subColor}`}>{sub}</div>}
+    </div>
+  );
+}
+
+function BotControl({
+  label,
+  sub,
+  status,
+  updatedAt,
+  onStart,
+  onStop,
+  loading,
+}: {
+  label: string;
+  sub: string;
+  status: string;
+  updatedAt: string | null;
+  onStart: () => void;
+  onStop: () => void;
+  loading: boolean;
+}) {
+  const isRunning = status === "running";
+  const isStopped = status === "stopped" || status === "unknown";
+  const isTransition = status === "starting" || status === "stopping";
+
+  const dotColor = isRunning
+    ? "bg-emerald-400 animate-pulse"
+    : isTransition
+    ? "bg-amber-400 animate-pulse"
+    : "bg-neutral-600";
+
+  const statusLabel = isRunning
+    ? "Running"
+    : status === "starting"
+    ? "Starting..."
+    : status === "stopping"
+    ? "Stopping..."
+    : status === "error"
+    ? "Error"
+    : "Stopped";
+
+  const statusColor = isRunning
+    ? "text-emerald-400"
+    : isTransition
+    ? "text-amber-400"
+    : status === "error"
+    ? "text-red-400"
+    : "text-neutral-500";
+
+  return (
+    <div className="rounded-lg border border-neutral-800 bg-neutral-900/40 p-4 flex items-center justify-between">
+      <div className="flex items-center gap-3">
+        <div className={`w-2.5 h-2.5 rounded-full ${dotColor}`} />
+        <div>
+          <div className="text-sm font-semibold text-neutral-100">{label}</div>
+          <div className="text-[10px] text-neutral-500">{sub}</div>
+          <div className={`text-[10px] font-medium mt-0.5 ${statusColor}`}>{statusLabel}</div>
+        </div>
+      </div>
+      <div className="flex gap-2">
+        <button
+          onClick={onStart}
+          disabled={loading || isRunning || isTransition}
+          className="px-3 py-1.5 text-xs font-semibold rounded-md transition-colors
+                     bg-emerald-500/10 text-emerald-400 border border-emerald-500/30
+                     hover:bg-emerald-500/20 hover:border-emerald-500/50
+                     disabled:opacity-30 disabled:cursor-not-allowed"
+        >
+          {loading && !isRunning ? "..." : "Start"}
+        </button>
+        <button
+          onClick={onStop}
+          disabled={loading || isStopped || isTransition}
+          className="px-3 py-1.5 text-xs font-semibold rounded-md transition-colors
+                     bg-red-500/10 text-red-400 border border-red-500/30
+                     hover:bg-red-500/20 hover:border-red-500/50
+                     disabled:opacity-30 disabled:cursor-not-allowed"
+        >
+          {loading && isRunning ? "..." : "Stop"}
+        </button>
+      </div>
     </div>
   );
 }

@@ -361,7 +361,7 @@ async def run_nasdaq_cycle(
     """Run analysis on NAS100 via OANDA. Nasdaq-specific session gating + earnings blackout."""
     from data.oanda_feed import fetch_forex_candles
     from execution.oanda_trader import OandaTrader
-    from engine.continuation import strategy_continuation_nasdaq
+    from engine.nasdaq_continuation import strategy_continuation_nasdaq
     from engine.earnings_calendar import is_earnings_blackout_nasdaq
     from engine.meta_filter import should_take_signal, load_prior_outcomes
     from engine.circuit_breaker import get_breaker
@@ -430,7 +430,7 @@ async def run_nasdaq_cycle(
     open_positions = await trader.get_open_trades()
 
     # ── GENERATE SIGNALS ──
-    # Use Nasdaq-optimized continuation strategy
+    # Use proven FVG-only Nasdaq strategy (30% WR, +$7.3K on backtest)
     signals = strategy_continuation_nasdaq(df)
 
     # Set symbol
@@ -560,8 +560,35 @@ async def run_live(args: argparse.Namespace) -> None:
     candle_seconds = _TF_SECONDS.get(args.timeframe, 900)
     last_optimizer_date = None
 
+    # Bot control state (dashboard can start/stop via Redis)
+    forex_enabled = mode in ("forex", "both")
+    nasdaq_enabled = mode == "nasdaq"
+
     while not _shutdown.is_set():
         try:
+            # ── Check dashboard commands (Redis) ──
+            try:
+                from cloud_sync import check_bot_command, push_bot_status
+                forex_cmd = await check_bot_command("forex")
+                nasdaq_cmd = await check_bot_command("nasdaq")
+                if forex_cmd == "start":
+                    forex_enabled = True
+                    log.info("Dashboard command: FOREX START")
+                elif forex_cmd == "stop":
+                    forex_enabled = False
+                    log.info("Dashboard command: FOREX STOP")
+                if nasdaq_cmd == "start":
+                    nasdaq_enabled = True
+                    log.info("Dashboard command: NASDAQ START")
+                elif nasdaq_cmd == "stop":
+                    nasdaq_enabled = False
+                    log.info("Dashboard command: NASDAQ STOP")
+                # Push status
+                await push_bot_status("forex", "running" if forex_enabled else "stopped")
+                await push_bot_status("nasdaq", "running" if nasdaq_enabled else "stopped")
+            except Exception:
+                pass  # Redis unavailable — continue trading
+
             in_session, session_name = is_in_session()
 
             # Session filter
@@ -577,9 +604,9 @@ async def run_live(args: argparse.Namespace) -> None:
                         signal_mgr, paper_trader, pos_mgr, risk_mgr,
                         tv_feed, args.symbol, args.timeframe,
                     )
-                if mode in ("forex", "both"):
+                if forex_enabled:
                     await run_forex_cycle(signal_mgr, pos_mgr, risk_mgr)
-                if mode == "nasdaq":
+                if nasdaq_enabled:
                     await run_nasdaq_cycle(signal_mgr, pos_mgr, risk_mgr)
                 await asyncio.sleep(candle_seconds)
             else:
